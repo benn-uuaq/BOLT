@@ -1,9 +1,9 @@
 import struct
 import socket
 import select
-import socket
 import time
 import queue
+import threading
 
 from pyModbusTCP.server import ModbusServer
 from pyModbusTCP.client import ModbusClient
@@ -60,11 +60,15 @@ class RobotDataConfig():
             'tcp_x', 'tcp_y', 'tcp_z', 'rot_x', 'rot_y', 'rot_z',
             'offset_px', 'offset_py', 'offset_pz', 'offset_rotx', 'offset_roty', 'offset_rotz',
             
-            # ... (Config, Masterboard 등 나머지 이름들 생략 없이 모두 여기에 포함) ...
+            # ★ [PATCH] Config 섹션은 배열 필드가 많으므로 (이름, 개수) 튜플로 매핑합니다.
+            #   기존에는 'dd'*6 같은 배열(60개 값)을 이름 20개로 1:1 매핑해서
+            #   이후 Masterboard 섹션의 safety_mode 등이 전부 밀려 있었습니다.
             'configuration_sub_len', 'configuration_sub_type',
-            'limit_min_joint_x', 'limit_max_joint_x', 'max_velocity_joint_x', 'max_acc_joint_x',
+            ('joint_limit_min_max', 12),     # [min0, max0, min1, max1, ...]
+            ('joint_max_vel_acc', 12),       # [vel0, acc0, vel1, acc1, ...]
             'default_velocity_joint', 'default_acc_joint', 'default_tool_velocity', 'default_tool_acc',
-            'internal_use', 'dh_a_joint_x', 'dh_d_joint_d', 'dh_alpha_joint_x', 'reserved_cfg',
+            'internal_use',
+            ('dh_a', 6), ('dh_d', 6), ('dh_alpha', 6), ('reserved_cfg', 6),
             'masterboard_version', 'control_box_type', 'robot_type', 'robot_structure', 'tool_io_type',
             'reserved_cfg2', 'reserved_cfg3',
             'masterboard_sub_len', 'masterboard_sub_type',
@@ -102,6 +106,13 @@ class RobotDataConfig():
             FMT_SAFETY +
             FMT_TOOL_COMM
         )
+
+        # ★ [PATCH] 포맷 필드 수와 이름 수가 다르면 즉시 알 수 있도록 검증
+        n_fields = len(struct.unpack(self.fmt, bytes(struct.calcsize(self.fmt))))
+        n_names = (len(self.names_pre) + len(self.names_joint) * 6 +
+                   sum(e[1] if isinstance(e, tuple) else 1 for e in self.names_post))
+        if n_fields != n_names:
+            raise ValueError(f"[RobotDataConfig] 필드 수({n_fields})와 이름 수({n_names}) 불일치")
 # ----------- RobotData for Elite CS robots -------------
 
 class RobotHeader():
@@ -139,9 +150,13 @@ class RobotData():
                     val = next(it)
                     getattr(data, name).append(val)
             
-            # [C] 관절 뒷부분 매핑 (나머지 전부)
-            for name in config.names_post:
-                setattr(data, name, next(it))
+            # [C] 관절 뒷부분 매핑 (나머지 전부) - (이름, 개수) 튜플은 리스트로 저장
+            for entry in config.names_post:
+                if isinstance(entry, tuple):
+                    name, cnt = entry
+                    setattr(data, name, [next(it) for _ in range(cnt)])
+                else:
+                    setattr(data, entry, next(it))
                 
             return data
 
@@ -184,15 +199,20 @@ class ReadAlarm():
         return None
         
 class Robot_30001():
+    MAX_PACKET_SIZE = 65536
+
     def __init__(self, ip, port2) -> None:
         config = RobotDataConfig()
         self.__data_config = config
         self.ip = ip
         self.port2 = port2
+        self.__sock = None
+        self.__buf = b""
         
         self.alarm_queue = queue.Queue()
 
     def connect_30001(self):
+        self.close()   # ★ [PATCH] 재연결 시 기존 소켓 정리
         try:
             self.__sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.__sock.settimeout(0.5)
@@ -203,12 +223,24 @@ class Robot_30001():
             return self.__sock
         except Exception as e:
             print(f"Error connecting to {self.ip} on port {self.port2}: {e}")
-            self.__sock = None 
+            self.close()
             return None 
+
+    def close(self):
+        """★ [PATCH] 외부(BOLT)에서 안전하게 소켓을 닫기 위한 메서드.
+        기존 BOLT 코드의 `self.robot_30001.__sock.close()`는 이름 맹글링 때문에
+        실제로는 `_BOLT__sock`을 찾다가 실패하여 소켓이 계속 누수되었습니다."""
+        sock = getattr(self, '_Robot_30001__sock', None)
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        self.__sock = None
+        self.__buf = b""
         
     def disconnect_30001(self):
-        self.__sock.close()
-        self.__sock = None
+        self.close()
 
     def get_data(self):
         return self.__recv()
@@ -228,6 +260,12 @@ class Robot_30001():
                 head = RobotHeader.unpack(self.__buf)
             except:
                 # 헤더 파싱 실패 시 버퍼 초기화 (오류 방지)
+                self.__buf = b""
+                break
+
+            # ★ [PATCH] 깨진 헤더(size<=0 또는 비정상적으로 큰 값)면 버퍼를 버리고 재동기화.
+            #   기존에는 size=0일 때 버퍼가 줄지 않아 GUI 스레드에서 무한루프가 발생할 수 있었습니다.
+            if head.size < 5 or head.size > self.MAX_PACKET_SIZE:
                 self.__buf = b""
                 break
 
@@ -262,6 +300,8 @@ class Robot_30001():
         """
         타임아웃 없이(0초), 현재 소켓 버퍼에 있는 모든 데이터를 읽어옵니다.
         """
+        if self.__sock is None:
+            raise ConnectionError("30001 not connected")
         while True:
             # select 타임아웃 0 -> 데이터가 있으면 즉시 True, 없으면 즉시 False
             readable, _, _ = select.select([self.__sock], [], [], 0)
@@ -394,43 +434,133 @@ variable -get variable
 '''
 
 class Robot_29999():
+    """
+    ★ [PATCH] 29999 대시보드 소켓은 GUI 스레드, 작업 스레드(최대 2개), 초기화/퍼지/리셋 스레드가
+    동시에 사용합니다. 기존에는 락이 없고 recv(4096) 1회로 응답을 받아서
+      - 다른 스레드의 응답을 가져가거나 (예: 변수 읽기에 "Stopping task"가 돌아옴)
+      - 늦게 온 응답이 버퍼에 남아 이후 모든 명령이 한 칸씩 밀리는
+    문제가 있었습니다. 아래 구현은
+      1) RLock으로 '송신 + 수신'을 원자적으로 묶고
+      2) 송신 전에 남아 있는 늦은 응답을 버리고
+      3) 줄바꿈(\n)까지 읽어 응답 경계를 맞추며
+      4) 실패 시 소켓을 닫아 다음 호출에서 자동 재연결되게 합니다.
+    """
+    DEFAULT_TIMEOUT = 2.0      # 기존 10초 → GUI 스레드 호출 시 프리징 최소화
+    MULTILINE_WAIT = 0.05      # status 등 여러 줄 응답의 추가 수신 대기
+
     def __init__(self, ip, port1):
         self.sock = None
         self.ip = ip
         self.port1 = port1
+        self._lock = threading.RLock()
+        self._var_cache = {}   # J_home, 웨이포인트 등 거의 변하지 않는 배열 변수 캐시
 
-    def connect_29999(self):
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(0.5)  # 타임아웃 설정 (중요)
-            self.sock.connect((self.ip, self.port1))
-            self.sock.settimeout(10.0)
-            print(f"Connected to {self.ip} on port {self.port1}")
+    def _close(self):
+        if self.sock is not None:
             try:
-                self.sock.recv(4096) 
+                self.sock.close()
             except Exception:
                 pass
-            return self.sock
-        except Exception as e:
-            print(f"Error connecting to {self.ip} on port {self.port1}: {e}")
-            return None
+        self.sock = None
 
-    def send_command_29999(self, command):
+    def close(self):
+        with self._lock:
+            self._close()
+
+    def connect_29999(self):
+        with self._lock:
+            self._close()
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(0.5)  # 타임아웃 설정 (중요)
+                self.sock.connect((self.ip, self.port1))
+                print(f"Connected to {self.ip} on port {self.port1}")
+                # 접속 배너가 있으면 버림 (없으면 0.5초 후 통과)
+                try:
+                    self.sock.recv(4096)
+                except Exception:
+                    pass
+                self.sock.settimeout(self.DEFAULT_TIMEOUT)
+                return self.sock
+            except Exception as e:
+                print(f"Error connecting to {self.ip} on port {self.port1}: {e}")
+                self._close()   # ★ 실패한 소켓을 남겨두면 자동 재연결이 영원히 안 됨
+                return None
+
+    def _drain(self):
+        """송신 전에 소켓에 남아 있는 늦은 응답을 모두 버립니다."""
+        self.sock.setblocking(False)
         try:
-            if self.sock is None:
-                if self.connect_29999() is None:
-                    print("[WARN] 29999 not connected; cannot send command")
-                    return
-            self.sock.sendall(f"{command}\n".encode("utf-8"))
-            response = self.sock.recv(4096).decode("utf-8").strip()
-            return response
-        except Exception as e:
-            print(f"Error sending command: {e}")
-            return None
+            while True:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("29999 closed by peer")
+                print(f"[29999] 남아 있던 응답 폐기: {chunk!r}")
+        except (BlockingIOError, InterruptedError):
+            pass
+        finally:
+            if self.sock is not None:
+                self.sock.setblocking(True)
+
+    def send_command_29999(self, command, multiline=False, timeout=None):
+        timeout = self.DEFAULT_TIMEOUT if timeout is None else timeout
+        with self._lock:
+            try:
+                if self.sock is None:
+                    if self.connect_29999() is None:
+                        print("[WARN] 29999 not connected; cannot send command")
+                        return None
+                self._drain()
+                self.sock.settimeout(timeout)
+                self.sock.sendall(f"{command}\n".encode("utf-8"))
+
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("29999 closed by peer")
+                    buf += chunk
+
+                if multiline:
+                    # status 처럼 여러 줄로 오는 응답은 짧게 추가 수신
+                    self.sock.settimeout(self.MULTILINE_WAIT)
+                    try:
+                        while True:
+                            chunk = self.sock.recv(4096)
+                            if not chunk:
+                                break
+                            buf += chunk
+                    except socket.timeout:
+                        pass
+                    finally:
+                        if self.sock is not None:
+                            self.sock.settimeout(timeout)
+
+                return buf.decode("utf-8", errors="replace").strip()
+            except Exception as e:
+                print(f"Error sending command '{command}': {e}")
+                self._close()
+                return None
+
+    def get_variable_cached(self, var_name):
+        """
+        ★ [PATCH] J_home, 웨이포인트처럼 운전 중 바뀌지 않는 배열 변수 전용.
+        정상적인 리스트를 받은 경우에만 캐시하며, 객체가 재생성(재연결)되면 초기화됩니다.
+        티칭펜던트에서 값을 수정했다면 재연결하거나 clear_variable_cache()를 호출하세요.
+        """
+        cached = self._var_cache.get(var_name)
+        if cached is not None:
+            return list(cached)
+        value = self.get_variable(var_name)
+        if isinstance(value, list) and len(value) == 6:
+            self._var_cache[var_name] = list(value)
+        return value
+
+    def clear_variable_cache(self):
+        self._var_cache.clear()
 
     def disconnect_29999(self):
-        self.sock.close()
-        self.sock = None
+        self.close()
 
     def robot_mode(self):
         return self.send_command_29999("robotMode")
@@ -618,6 +748,7 @@ class Robot_modbus():
         success = self.client.write_single_coil(address, safe_bool)
         if not success:
             print(f"[Modbus Error] Coil {address} 쓰기 실패")
+        return bool(success)   # ★ [PATCH] 호출부에서 실패를 판단할 수 있도록 반환
 
     def get_all_coils(self, start_address, count) -> list:
         bits = self.client.read_coils(start_address, count)

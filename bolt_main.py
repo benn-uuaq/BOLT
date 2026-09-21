@@ -377,12 +377,20 @@ class BlinkController:
     def __init__(self):
         self.blink_thread = None
         self.blink_stop_event = threading.Event()
+        self._blink_key = None
 
     def start_blink(self, target_func, on_status, off_status, on_time=0.5, off_time=None):
-        self.stop_blink()
-
         if off_time is None:
             off_time = on_time
+
+        # ★ [PATCH] robot_status_update가 100ms마다 호출되면서 깜빡임 스레드를 매번 재시작하던 문제 수정.
+        #   (0.5초 주기가 끝나기 전에 리셋되어 사실상 상시 점등 + IO 큐에 초당 수십 건 쓰기 발생)
+        key = (target_func, tuple(on_status), tuple(off_status), on_time, off_time)
+        if self.blink_thread is not None and self.blink_thread.is_alive() and self._blink_key == key:
+            return
+
+        self.stop_blink()
+        self._blink_key = key
 
         self.blink_stop_event.clear()
 
@@ -396,6 +404,7 @@ class BlinkController:
             self.blink_stop_event.set() 
             self.blink_thread.join() 
             self.blink_thread = None
+        self._blink_key = None
 
     def _blink_loop(self, target_func, on_status, off_status, on_time, off_time):
         """실제 깜빡임 동작을 수행하는 내부 함수"""
@@ -1116,6 +1125,13 @@ class BOLT(QMainWindow):
         
         self._bolt_detect_latched = False
         self.is_waiting_for_bolt = False
+
+        # ★ [PATCH] 볼트 통과 센서(MDI 41) 펄스 카운터 (전용 감시 스레드가 증가시킴)
+        self._sfd_lock = threading.Lock()
+        self._sfd_pulse_count = 0      # 프로그램 시작 후 감지된 통과 펄스 총 수
+        self._sfd_pulse_mark = 0       # '여기까지는 설명된 펄스' 기준값 (초과분 = 예상 밖 볼트 통과)
+        self._last_feed_status = None  # "DETECTED" / "NOT_DETECTED" / "EXTRA_PULSE_SKIP"
+        self._start_sfd_sensor_monitor()
         
         last_mode = self.load_last_mode()
         print(f"\n==========================================")
@@ -1299,12 +1315,14 @@ class BOLT(QMainWindow):
     def create_robot_objects(self):
         """객체만 생성하고 실제 소켓 연결은 하지 않음 (빠른 부팅용)"""
         # 기존 연결 객체가 있다면 정리
+        # ★ [PATCH] self.robot_30001.__sock 은 BOLT 클래스 안에서 _BOLT__sock 으로 해석되어
+        #   항상 실패(→ 소켓 누수)했습니다. 각 클래스의 close()를 사용합니다.
         if hasattr(self, 'robot_30001') and self.robot_30001:
-            try: self.robot_30001.__sock.close() 
-            except: pass
+            try: self.robot_30001.close()
+            except Exception: pass
         if hasattr(self, 'robot_29999') and self.robot_29999:
-            try: self.robot_29999.sock.close()
-            except: pass
+            try: self.robot_29999.close()
+            except Exception: pass
         if hasattr(self, 'modbus_client') and self.modbus_client is not None:
             try: self.modbus_client.disconnect()
             except: pass
@@ -1364,12 +1382,14 @@ class BOLT(QMainWindow):
             self.alarm_thread.stop()
             self.alarm_thread = None
 
+        # ★ [PATCH] self.robot_30001.__sock 은 BOLT 클래스 안에서 _BOLT__sock 으로 해석되어
+        #   항상 실패(→ 소켓 누수)했습니다. 각 클래스의 close()를 사용합니다.
         if hasattr(self, 'robot_30001') and self.robot_30001:
-            try: self.robot_30001.__sock.close() 
-            except: pass
+            try: self.robot_30001.close()
+            except Exception: pass
         if hasattr(self, 'robot_29999') and self.robot_29999:
-            try: self.robot_29999.sock.close()
-            except: pass
+            try: self.robot_29999.close()
+            except Exception: pass
         if hasattr(self, 'modbus_client') and self.modbus_client is not None:
             try: self.modbus_client.disconnect()
             except: pass
@@ -1892,7 +1912,7 @@ class BOLT(QMainWindow):
         """
         try:
             # 1. 상태 요청 (29999 포트)
-            status_res = self.robot_29999.send_command_29999("status")
+            status_res = self.robot_29999.send_command_29999("status", multiline=True)
             if not status_res:
                 print("[WARN] 초기 상태 읽기 실패 (응답 없음)")
                 return
@@ -1927,7 +1947,7 @@ class BOLT(QMainWindow):
     def check_connection_alive(self):
         try:
             # 1. 29999 포트에 상태(status) 명령 전송
-            status_res = self.robot_29999.send_command_29999("status")
+            status_res = self.robot_29999.send_command_29999("status", multiline=True)
             
             # 응답이 아예 없거나 "Error" 텍스트가 포함되어 있으면 통신 끊김
             if not status_res or "Error" in status_res:
@@ -2150,6 +2170,10 @@ class BOLT(QMainWindow):
                     self.actual_joint_wrist1 = data.actual_joint[3]
                     self.actual_joint_wrist2 = data.actual_joint[4]
                     self.actual_joint_wrist3 = data.actual_joint[5]
+
+                    # ★ [PATCH] 수동 moveL 도착 검증용 TCP 좌표
+                    self.actual_tcp = [data.tcp_x, data.tcp_y, data.tcp_z,
+                                       data.rot_x, data.rot_y, data.rot_z]
 
             except Exception as e:
                 pass
@@ -3157,13 +3181,10 @@ class BOLT(QMainWindow):
             self.is_message_active = False
             self.set_variable_with_ui("system_NG", 0)
 
-            # 혹시 작업 스레드가 돌고 있다면 강제로 멈춥니다.
-            t1 = self.threads.get(1)
-            t2 = self.threads.get(2)
-            t0 = self.threads.get(0)
-            if t1 and t1.isRunning(): t1.terminate()
-            if t2 and t2.isRunning(): t2.terminate()
-            if t0 and t0.isRunning(): t0.terminate()
+            # ★ [PATCH] terminate() 제거 → 협조적 종료(requestInterruption)
+            #   terminate는 finally를 건너뛰고 락/소켓을 잡은 채 스레드를 죽여
+            #   뮤트 고착, modbus_lock 데드락, 29999 응답 밀림을 유발할 수 있습니다.
+            self._request_job_threads_stop()
             
             self.active_popups = {1: None, 2: None, 0: None}
             self.robot_occupant = 0
@@ -3373,6 +3394,20 @@ class BOLT(QMainWindow):
             print(f"[WARN] is_idle_state 검사 오류: {e}")
             return False
         
+    def _put_do_if_changed(self, idx, val):
+        """★ [PATCH] 현재 출력 상태와 같으면 큐에 넣지 않음.
+        robot_status_update(100ms 주기)가 램프/부저를 매번 써서 초당 수십 건이 Send_que에 쌓이면,
+        같은 큐를 쓰는 너트러너 START / 피더기 펄스의 타이밍이 밀리거나 펄스 폭이 줄어듭니다."""
+        if self.io_module is None:
+            return
+        try:
+            outputs = self.io_module.Read_Output_Data()
+            if outputs and len(outputs) > idx and int(outputs[idx]) == int(val):
+                return
+        except Exception:
+            pass
+        self.io_module.Send_que.put(self.io_module.Write_DO_Data(idx, val))
+
     def lamp_control(self, status):
         """
         status 리스트에 따라 타워램프(MDO 28~31)를 제어합니다.
@@ -3390,12 +3425,8 @@ class BOLT(QMainWindow):
             if i < len(status) and status[i] == "ON":
                 bit_val = 1
             
-            # 2. 개별 비트에 대한 명령 생성
-            # 주의: Write_DO_Data의 첫 인자는 '상대 주소(index)'여야 합니다. (Address 아님)
-            cmd = self.io_module.Write_DO_Data(idx, bit_val)
-            
-            # 3. 명령 큐에 삽입
-            self.io_module.Send_que.put(cmd)
+            # 2~3. ★ [PATCH] 상태가 바뀔 때만 명령 큐에 삽입
+            self._put_do_if_changed(idx, bit_val)
     
     def buzzer_control(self, status):
         if self.io_module is None:
@@ -3422,8 +3453,7 @@ class BOLT(QMainWindow):
             if i < len(status) and status[i] == "ON":
                 bit_val = 1
             
-            cmd = self.io_module.Write_DO_Data(idx, bit_val)
-            self.io_module.Send_que.put(cmd)
+            self._put_do_if_changed(idx, bit_val)   # ★ [PATCH] 상태가 바뀔 때만
             
     def set_alarm_output(self, status):
         """깜빡일 때 램프와 부저를 동시에 제어하는 함수"""
@@ -3652,8 +3682,9 @@ class BOLT(QMainWindow):
                 self.home_check_timer.stop()
                 
             # ★ 목적지(홈) 관절 좌표를 미리 가져와서 저장해둡니다. (근처 도달 확인용)
-            raw_home = self.robot_29999.get_variable("J_home")
-            self._target_home_joints = ast.literal_eval(raw_home) if isinstance(raw_home, str) else raw_home
+            raw_home = self.robot_29999.get_variable_cached("J_home")   # ★ [PATCH] 캐시
+            # ★ [PATCH] "NOT_FOUND" 등 문자열이 오면 literal_eval 예외로 home_req=1이 남던 문제 수정
+            self._target_home_joints = raw_home if isinstance(raw_home, list) else None
                 
             self.home_check_timer = QtCore.QTimer(self)
             self.home_check_timer.timeout.connect(self.check_home_arrival)
@@ -3733,6 +3764,27 @@ class BOLT(QMainWindow):
             except Exception as e:
                 print(f"[ERROR] 작업 재시작 오류: {e}")
             
+    def _request_job_threads_stop(self):
+        """★ [PATCH] 작업 스레드 협조적 종료 요청 + terminate 시절 고착되던 플래그 초기화"""
+        self._user_stop_requested = True   # 이 종료로 인한 '작업 비정상 종료' 알람 중복 방지
+        for key in (1, 2, 0):
+            t = self.threads.get(key)
+            if t is not None and t.isRunning():
+                t.requestInterruption()
+        # 일시정지 대기 중인 스레드도 깨워서 wait_check()에서 빠져나가게 함
+        self.pause_event.set()
+        self._reset_sequence_flags()
+
+    def _reset_sequence_flags(self):
+        """스레드가 비정상 종료되어도 뮤트/지그 상태 플래그가 남지 않도록 강제 초기화"""
+        self.is_jig_moving_1 = False
+        self.is_jig_moving_2 = False
+        self._mute_changing = False
+        self.seq_mute_active = False
+        self.overlap_in_progress = False
+        self.cross_trigger_cell = None
+        self.is_waiting_for_bolt = False
+
     def on_stop_button_clicked(self):
         try:
             try:
@@ -3747,13 +3799,11 @@ class BOLT(QMainWindow):
             self.ui.auto_btn.setChecked(False)
             self.ui.manual_btn.setChecked(True)
             
-            # 돌아가고 있는 작업 스레드(JobThread) 강제 종료
-            t1 = self.threads.get(1)
-            t2 = self.threads.get(2)
-            t0 = self.threads.get(0)
-            if t1 and t1.isRunning(): t1.requestInterruption(); t1.terminate()
-            if t2 and t2.isRunning(): t2.requestInterruption(); t2.terminate()
-            if t0 and t0.isRunning(): t0.requestInterruption(); t0.terminate()
+            # ★ [PATCH] 수동 포즈 이동 대기 루프 중단 요청 (정지를 '도착'으로 오인하던 문제)
+            self._manual_abort = True
+
+            # ★ [PATCH] terminate() 제거 → 협조적 종료. 스레드는 다음 wait_check()에서 빠져나갑니다.
+            self._request_job_threads_stop()
             
             # 큐 및 변수 찌꺼기 초기화
             self.waiting_cell = None
@@ -4233,6 +4283,7 @@ class BOLT(QMainWindow):
             thread.finished_signal.connect(self.on_job_finished)
             
             # 스레드 저장 및 시작
+            self._user_stop_requested = False
             self.threads[cell_num] = thread
             thread.start()
             
@@ -4285,212 +4336,450 @@ class BOLT(QMainWindow):
     # [SECTION 1] 공통 서브 태스크 (Common Sub-Tasks)
     # ====================================================================
     
+    # ====================================================================
+    # ★ [PATCH] 볼트 통과 센서(MDI 41) 전용 감시 스레드
+    #   센서가 공급 호스 중간에 있어 볼트가 지나가는 순간에만 짧게 ON 됩니다.
+    #   UI 타이머(30ms)나 작업 루프의 폴링에 의존하면 펄스를 놓치므로,
+    #   별도 스레드가 짧은 주기로 입력을 읽어 상승 에지를 '카운트'합니다.
+    #   공급 판정은 "슈팅 전후 카운트가 늘었는가"로 하므로 타이밍과 무관하게 잡힙니다.
+    #   ※ 단, IO 모듈(IOmodule.py)이 입력을 갱신하는 주기보다 짧은 펄스는
+    #     어떤 소프트웨어로도 볼 수 없습니다 → 센서 앰프 OFF 딜레이 병행 권장.
+    # ====================================================================
+    SFD_DETECT_MDI    = 41     # 볼트 통과 센서 입력 번호
+    SFD_MON_INTERVAL  = 0.002  # 감시 주기 [s]
+    SFD_EDGE_DEBOUNCE = 0.10   # 이 시간 안의 재상승은 같은 볼트(채터링)로 간주 [s]
+
+    def _start_sfd_sensor_monitor(self):
+        th = getattr(self, '_sfd_mon_thread', None)
+        if th is not None and th.is_alive():
+            return
+        # Windows 기본 sleep 해상도(약 15.6ms)를 1ms로 → 짧은 주기 감시 가능
+        if platform.system() == "Windows":
+            try:
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception as e:
+                print(f"[SFD MON] timeBeginPeriod 설정 실패(무시): {e}")
+        self._sfd_mon_stop = threading.Event()
+        self._sfd_mon_thread = threading.Thread(target=self._sfd_sensor_monitor_loop,
+                                                name="SFD_SENSOR_MON", daemon=True)
+        self._sfd_mon_thread.start()
+        print("[SFD MON] 볼트 통과 센서 감시 스레드 시작")
+
+    def _sfd_sensor_monitor_loop(self):
+        idx = self.SFD_DETECT_MDI
+        prev = 0
+        rise_t = None
+        last_rise_t = 0.0
+        stat_n, stat_sum, stat_max, stat_done = 0, 0.0, 0.0, False
+        last_io = None
+
+        while not self._sfd_mon_stop.is_set():
+            io = self.io_module
+            if io is None:
+                prev, rise_t = 0, None
+                time.sleep(0.1)
+                continue
+            if io is not last_io:            # IO 재연결 시 상태/통계 초기화
+                last_io = io
+                prev, rise_t = 0, None
+                stat_n, stat_sum, stat_max, stat_done = 0, 0.0, 0.0, False
+            try:
+                t0 = time.perf_counter()
+                inp = io.Read_Input_Data()
+                call_dt = time.perf_counter() - t0
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if not inp or len(inp) <= idx:
+                time.sleep(0.05)
+                continue
+
+            # 진단: 입력 읽기 1회 소요시간 (통신을 직접 하는 구조면 이 값이 곧 감시 주기)
+            if not stat_done:
+                stat_n += 1
+                stat_sum += call_dt
+                stat_max = max(stat_max, call_dt)
+                if stat_n >= 2000:
+                    stat_done = True
+                    print(f"[SFD MON] Read_Input_Data 소요: 평균 {stat_sum / stat_n * 1000:.2f}ms, "
+                          f"최대 {stat_max * 1000:.2f}ms (감시 주기 {self.SFD_MON_INTERVAL * 1000:.0f}ms)")
+
+            val = 1 if inp[idx] == 1 else 0
+            now = time.time()
+            if val == 1 and prev == 0:
+                rise_t = now
+                if now - last_rise_t >= self.SFD_EDGE_DEBOUNCE:
+                    with self._sfd_lock:
+                        self._sfd_pulse_count += 1
+                        n = self._sfd_pulse_count
+                    # 기존 퍼지(배출) 시퀀스 호환: 대기 구간이면 래치도 세움
+                    if getattr(self, 'is_waiting_for_bolt', False):
+                        self._bolt_detect_latched = True
+                    print(f"[SFD MON] 볼트 통과 펄스 감지 #{n}")
+                last_rise_t = now
+            elif val == 0 and prev == 1 and rise_t is not None:
+                print(f"[SFD MON]   └ 관측된 펄스 폭 약 {(now - rise_t) * 1000:.0f}ms")
+                rise_t = None
+            prev = val
+            time.sleep(self.SFD_MON_INTERVAL)
+
+    def _sfd_get_pulse_count(self):
+        with self._sfd_lock:
+            return self._sfd_pulse_count
+
+    def _sfd_sync_mark(self):
+        """현재까지의 펄스를 모두 '설명된 것'으로 간주 (작업 시작 시 호출)"""
+        self._sfd_pulse_mark = self._sfd_get_pulse_count()
+
+    # ====================================================================
+    # ★ [PATCH] 볼트 공급 설정값 - 현장에서 조정
+    # ====================================================================
+    SFD_READY_TIMEOUT   = 5.0   # 피더 Ready 대기 [s] (1회당)
+    SFD_READY_ATTEMPTS  = 3     # Ready 대기 재시도 횟수 (슈팅 전이므로 볼트 누적 위험 없음)
+    SFD_START_PULSE     = 0.5   # 피더 START 출력 유지 시간 [s] (기존값)
+    SFD_DETECT_TIMEOUT  = 2.0   # START OFF 후 통과 감지 대기 [s]
+    SFD_SETTLE_TIME     = 0.05  # 감지 후 팁 안착 대기 [s] (기존값)
+    SFD_SKIP_FEED_ON_EXTRA_PULSE = True
+    # True: 직전 공급 이후 예상 밖 통과 펄스(지연 도착/이중 공급)가 있었으면
+    #       팁에 볼트가 있다고 보고 이번 슈팅을 생략 (볼트 누적 → 파이프 파손 방지)
+
     # 1-1. 볼트 공급
-    def task_feed_bolt(self, mdo_sfd_start, mdi_sfd_bolt_detect, mdi_sfd_ready, mdi_sfd_err, max_retries=3):
+    # ★ [PATCH] 슈팅은 위치당 1회만. 미감지여도 작업을 멈추지 않고 체결을 시도합니다.
+    #   (볼트가 실제로 없으면 너트러너가 토크 미도달 NG → 작업 종료 후 NG 목록으로 수동 체결)
+    def task_feed_bolt(self, mdo_sfd_start, mdi_sfd_bolt_detect, mdi_sfd_ready, mdi_sfd_err, max_retries=None):
+        """
+        반환: True  = 체결 진행 (감지 결과는 self._last_feed_status 참고)
+              False = 작업 정지 (피더 에러 / Ready 불가 → 슈팅 자체를 못 한 경우)
+        max_retries 인자는 호환용으로 남겨두었으며 사용하지 않습니다 (슈팅은 항상 1회).
+        """
         print("[AUTO FEED] 볼트 공급 시작 (SFD)")
-        
-        if self.io_module.Read_Input_Data()[mdi_sfd_err] == 1:
+        self._last_feed_status = None
+
+        if self._read_inputs_checked()[mdi_sfd_err] == 1:
             msg = "피더기(SFD) 에러 상태입니다. 리셋이 필요합니다."
             print(f"[ERROR] {msg}")
             self.report_alarm_signal.emit(msg, "ERROR")
             return False
 
-        for attempt in range(1, max_retries + 1):
-            print(f"[AUTO FEED] 볼트 공급 시도 ({attempt}/{max_retries})")
-            
-            # =========================================================
-            # ★ [추가] 피더기가 볼트를 쏠 준비(Ready)가 되었는지 먼저 확인
-            # =========================================================
-            print("[AUTO FEED] 피더기 Ready 신호 대기 중...")
-            ready_start_t = time.time()
-            is_ready = False
-            
-            # 볼트를 진동으로 끌어올리는 시간이 있으므로 최대 5초 대기
-            while time.time() - ready_start_t < 5.0: 
-                self.wait_check()
-                inputs = self.io_module.Read_Input_Data()
-                
+        # (0) 직전 공급 이후 예상 밖 통과 펄스 확인 → 팁에 볼트가 이미 있을 수 있음
+        now_cnt = self._sfd_get_pulse_count()
+        extra = now_cnt - self._sfd_pulse_mark
+        if extra > 0 and self.SFD_SKIP_FEED_ON_EXTRA_PULSE:
+            msg = f"직전 공급 이후 예상 밖 볼트 통과 {extra}회 감지 → 팁에 볼트 있음으로 판단, 이번 공급 생략"
+            print(f"[AUTO FEED WARN] {msg}")
+            self.report_alarm_signal.emit(msg, "INFO")
+            self._sfd_pulse_mark = now_cnt
+            self.is_bolt_loaded = True
+            self._last_feed_status = "EXTRA_PULSE_SKIP"
+            return True
+
+        # (1) 피더 Ready 대기 (아직 쏘지 않았으므로 재시도해도 안전)
+        is_ready = False
+        for r_try in range(1, self.SFD_READY_ATTEMPTS + 1):
+            print(f"[AUTO FEED] 피더기 Ready 신호 대기 중... ({r_try}/{self.SFD_READY_ATTEMPTS})")
+            t0 = time.time()
+            while True:
+                paused = self._wait_check_timed()
+                if paused > 0.05:
+                    t0 += paused
+                inputs = self._read_inputs_checked()
                 if inputs[mdi_sfd_err] == 1:
                     msg = "Ready 대기 중 피더기(SFD) 에러 발생!"
                     print(f"[ERROR] {msg}")
                     self.report_alarm_signal.emit(msg, "ERROR")
                     return False
-                    
-                # Ready 신호가 1(ON)이 되면 대기 루프 탈출
                 if inputs[mdi_sfd_ready] == 1:
                     is_ready = True
                     break
-                    
-                time.sleep(0.1)
-                
-            if not is_ready:
-                print(f"[WARN] 피더기 Ready 신호 타임아웃 (시도 {attempt}회차 실패)")
-                # 레디가 안 되면 쏘지 않고 다음 시도(또는 실패 처리)로 넘어감
-                if attempt < max_retries:
-                    time.sleep(1.0)
-                    continue
-                else:
-                    break 
-            
-            print("[AUTO FEED] 피더기 Ready 확인 완료. 공급 펄스 전송.")
-            # =========================================================
-            
-            # 래치 초기화
-            self._bolt_detect_latched = False
-            self.is_waiting_for_bolt = True 
-            
-            # 피더기 구동 펄스 전송 (안정성을 위해 0.05초 -> 0.1초로 살짝 여유를 줌)
+                if time.time() - t0 > self.SFD_READY_TIMEOUT:
+                    break
+                time.sleep(0.05)
+            if is_ready:
+                break
+            print(f"[WARN] 피더기 Ready 신호 타임아웃 ({r_try}/{self.SFD_READY_ATTEMPTS})")
+            if r_try < self.SFD_READY_ATTEMPTS:
+                time.sleep(1.0)
+
+        if not is_ready:
+            msg = "피더기(SFD) Ready 신호 없음 - 볼트 소진 또는 피더 정지 확인 필요"
+            print(f"[ERROR] {msg}")
+            self.report_alarm_signal.emit(msg, "ERROR")
+            return False
+
+        if self._read_inputs_checked()[mdi_sfd_bolt_detect] == 1:
+            print("[AUTO FEED WARN] 슈팅 전인데 통과 센서가 ON 상태입니다 (센서 앞 볼트 걸림/센서 이상 의심)")
+
+        # (2) 슈팅 1회 + 통과 펄스 대기 (카운터 기준 → 짧은 펄스도 감시 스레드가 잡음)
+        print("[AUTO FEED] 피더기 Ready 확인 완료. 공급 펄스 전송 (1회)")
+        base_cnt = self._sfd_get_pulse_count()
+        self._bolt_detect_latched = False
+        self.is_waiting_for_bolt = True
+        detected = False
+        start_off_sent = False
+        t_shot = time.time()
+        try:
             self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_sfd_start, 1))
-            time.sleep(0.5)
-            self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_sfd_start, 0))
-            
-            start_t = time.time()
-            success = False
-            
             while True:
-                self.wait_check() 
-                inputs = self.io_module.Read_Input_Data()
-                
-                if inputs[mdi_sfd_err] == 1:
+                paused = self._wait_check_timed()
+                if paused > 0.05:
+                    t_shot += paused
+                elapsed = time.time() - t_shot
+
+                if not start_off_sent and elapsed >= self.SFD_START_PULSE:
+                    self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_sfd_start, 0))
+                    start_off_sent = True
+
+                if self._sfd_get_pulse_count() > base_cnt:
+                    detected = True
+                    print(f"[AUTO FEED] 볼트 통과 감지됨 (슈팅 후 {elapsed:.2f}s)")
+                    break
+
+                if self._read_inputs_checked()[mdi_sfd_err] == 1:
                     msg = "공급 중 피더기(SFD) 에러 발생!"
                     print(f"[ERROR] {msg}")
                     self.report_alarm_signal.emit(msg, "ERROR")
-                    self.is_waiting_for_bolt = False
                     return False
-                    
-                # ==============================================================
-                # ★ [수정 핵심] == 0 이 아니라 == 1 로 변경! 
-                # 센서가 순간적으로 켜지거나(1) 백그라운드에서 래치가 걸렸을 때 성공
-                # ==============================================================
-                if inputs[mdi_sfd_bolt_detect] == 1 or getattr(self, '_bolt_detect_latched', False):
-                    print(f"[AUTO FEED] 볼트 통과 감지됨! (시도 {attempt}회차)")
-                    self.is_bolt_loaded = True
-                    success = True
-                    
-                    # 볼트가 센서를 통과한 후 너트러너 팁에 완전히 안착할 시간 부여
-                    # 이 대기시간이 없으면 볼트가 도착하기도 전에 체결을 시작할 수 있습니다.
-                    time.sleep(0.05) 
+
+                if elapsed > self.SFD_START_PULSE + self.SFD_DETECT_TIMEOUT:
                     break
-                
-                if time.time() - start_t > 2.0:
-                    print(f"[WARN] 볼트 감지 시간 초과 (시도 {attempt}회차 실패)")
-                    break 
-                    
-                # 펄스를 놓치지 않기 위해 감시 주기를 더 짧게 변경 (0.05 -> 0.01)
-                time.sleep(0.01) 
-                
-            self.is_waiting_for_bolt = False 
-            
-            if success:
+                time.sleep(0.01)
+
+            # 감지 직후 START를 끄지 않았다면 최소 펄스 폭은 채운 뒤 OFF
+            if not start_off_sent:
+                remain = self.SFD_START_PULSE - (time.time() - t_shot)
+                if remain > 0:
+                    time.sleep(remain)
+        finally:
+            try:
+                self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_sfd_start, 0))
+            except Exception:
+                pass
+            self.is_waiting_for_bolt = False
+
+        if detected:
+            time.sleep(self.SFD_SETTLE_TIME)
+            # 이번 슈팅으로 설명되는 펄스는 1개. 그 이상(이중 공급/뒤늦은 도착)은 다음 공급 때 '예상 밖'으로 잡힘
+            self._sfd_pulse_mark = base_cnt + 1
+            self.is_bolt_loaded = True
+            self._last_feed_status = "DETECTED"
+        else:
+            # 재슈팅 금지 (볼트가 호스에 걸려 있다 늦게 오면 2개 누적되어 파이프 파손)
+            self._sfd_pulse_mark = base_cnt
+            self.is_bolt_loaded = False
+            self._last_feed_status = "NOT_DETECTED"
+            msg = "볼트 공급 미감지 - 재공급 없이 체결 시도 (볼트 없으면 NG 처리 후 계속 진행)"
+            print(f"[AUTO FEED WARN] {msg}")
+            self.report_alarm_signal.emit(msg, "INFO")
+        return True
+
+    # ====================================================================
+    # ★ [PATCH] 너트러너 회전(RUN) 감시 설정값 - 현장에서 조정
+    # ====================================================================
+    NR_RUN_CLEAR_TIMEOUT = 1.0    # START 전, 이전 사이클의 RUN(MDI 33)이 꺼질 때까지 대기 [s]
+    NR_RUN_START_TIMEOUT = 1.0    # START 후 RUN이 켜질 때까지 대기 [s]
+    NR_START_MIN_PULSE   = 0.15   # START 최소 유지 시간 [s] (기존 50ms 큐 펄스는 누락 가능)
+    NR_START_ATTEMPTS    = 3      # START→RUN 확인 최대 시도 횟수 (모두 실패 시 알람)
+    NR_RETRY_INTERVAL    = 0.3    # 재시도 전 START OFF 유지 시간 [s]
+    NR_RUN_DROP_GRACE    = 0.5    # 체결 중 RUN이 꺼진 뒤 OK/NG 결과를 기다리는 허용 시간 [s]
+    NR_TIGHTEN_TIMEOUT   = 5.0    # 하강 후 체결 결과 대기 [s] (일시정지 시간 제외)
+    NR_ABORT_IDLE_WAIT   = 6.0    # 비정상 종료 시 NR이 스스로 사이클을 끝낼 때까지 대기 [s]
+    NR_NO_RUN_STOP_JOB   = True   # True : 회전 미시작 시 작업 정지(알람)
+                                  # False: 해당 볼트만 NG 처리, 실린더는 내리지 않고 볼트는 팁에 유지한 채 다음 위치 진행
+
+    def _wait_check_timed(self, ignore_auto_mode=False):
+        """wait_check() 수행 후 그 안에서 머문 시간(일시정지 시간)을 반환 → 타임아웃 계산에서 제외"""
+        t0 = time.time()
+        self.wait_check(ignore_auto_mode=ignore_auto_mode)
+        return time.time() - t0
+
+    def _read_inputs_checked(self, min_len=45):
+        inp = self.io_module.Read_Input_Data() if self.io_module is not None else None
+        if not inp or len(inp) < min_len:
+            raise Exception("IO 입력 읽기 실패 (IO 모듈 통신 확인)")
+        return inp
+
+    def _nr_wait_run_clear(self, mdi_nr_run, timeout, label):
+        """RUN 신호가 0이 될 때까지 대기. 시간 내 해제되지 않으면 예외."""
+        start_t = time.time()
+        while True:
+            paused = self._wait_check_timed()
+            if paused > 0.05:
+                start_t += paused
+            if self._read_inputs_checked()[mdi_nr_run] == 0:
                 return True
-                
-            # 실패 시 다음 시도 전 잠시 대기
-            if attempt < max_retries:
-                time.sleep(1.0) 
-                
-        # 최대 재시도 횟수 초과
-        msg = f"피더기(SFD) 볼트 공급 최종 실패 ({max_retries}회 재시도 초과)"
-        print(f"[ERROR] {msg}")
-        self.report_alarm_signal.emit(msg, "ERROR")
-        return False
+            if time.time() - start_t > timeout:
+                raise Exception(f"너트러너 RUN 신호가 해제되지 않음 ({label}, {timeout:.1f}s)")
+            time.sleep(0.02)
+
+    def _nr_start_and_confirm_run(self, mdo_nr_start, mdi_nr_run, mdi_nr_err):
+        """
+        START를 켜고 RUN(회전) 신호를 확인한 뒤 START를 끕니다.
+        반환: "RUN"(회전 확인) / "NO_RUN"(재시도 후에도 회전 없음) / "ERR"(NR 에러)
+        """
+        for attempt in range(1, self.NR_START_ATTEMPTS + 1):
+            self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_start, 1))
+            t_on = time.time()
+            run_ok = False
+            err = False
+            while True:
+                paused = self._wait_check_timed()
+                if paused > 0.05:
+                    t_on += paused
+                inp = self._read_inputs_checked()
+                if inp[mdi_nr_err] == 1:
+                    err = True
+                    break
+                if inp[mdi_nr_run] == 1:
+                    run_ok = True
+                    run_detect_t = time.time() - t_on
+                    break
+                if time.time() - t_on > self.NR_RUN_START_TIMEOUT:
+                    break
+                time.sleep(0.01)
+
+            # 최소 펄스 폭 보장 후 START OFF (큐 처리 지연으로 펄스가 사라지는 것 방지)
+            remain = self.NR_START_MIN_PULSE - (time.time() - t_on)
+            if remain > 0:
+                time.sleep(remain)
+            self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_start, 0))
+
+            if err:
+                return "ERR"
+            if run_ok:
+                print(f"[NR] 회전(RUN) 확인 (START 후 {run_detect_t:.2f}s, 시도 {attempt})")
+                return "RUN"
+
+            print(f"[NR WARN] START 후 {self.NR_RUN_START_TIMEOUT:.1f}s 동안 RUN 미감지 "
+                  f"(시도 {attempt}/{self.NR_START_ATTEMPTS})")
+            if attempt < self.NR_START_ATTEMPTS:
+                print(f"[NR] {self.NR_RETRY_INTERVAL:.1f}s 후 START 재시도")
+                time.sleep(self.NR_RETRY_INTERVAL)
+        return "NO_RUN"
+
+    def _nr_monitor_tightening(self, mdi_nr_ok, mdi_nr_run, mdi_nr_ng, mdi_nr_err, mdi_nr_down_chk):
+        """
+        하강 후 체결 결과 감시. 반환: (res, reason, nr_may_still_run)
+        RUN이 결과 신호 없이 꺼지면 '회전 중단'으로 NG 처리합니다.
+        """
+        print("[NR] 체결 프로세스 감시 중 (RUN 신호 포함)...")
+        start_t = time.time()
+        last_run_on_t = time.time()
+        while True:
+            paused = self._wait_check_timed()
+            if paused > 0.05:
+                start_t += paused
+                last_run_on_t += paused
+
+            inp = self._read_inputs_checked()
+            now = time.time()
+            if inp[mdi_nr_run] == 1:
+                last_run_on_t = now
+
+            if inp[mdi_nr_ok] == 1:
+                if inp[mdi_nr_down_chk] == 0:
+                    return "NG", "실린더 오작동 (체결 중 들림)", False
+                return "OK", "", False
+
+            if inp[mdi_nr_ng] == 1:
+                error_msg = self.query_nr_error_code("NG")
+                reason = error_msg.split("-")[1].strip() if "-" in error_msg else error_msg
+                print(f"[NG 감지] 체결 실패 (사유: {reason})")
+                return "NG", reason, False
+
+            if inp[mdi_nr_err] == 1:
+                error_msg = self.query_nr_error_code("ERR")
+                self.report_alarm_signal.emit(f"너트러너 시스템 에러: {error_msg}", "WARN")
+                raise Exception(f"Nutrunner System Error: {error_msg}")
+
+            if now - last_run_on_t > self.NR_RUN_DROP_GRACE:
+                return "NG", "너트러너 회전 중단 (결과 신호 없이 RUN 해제)", False
+
+            if now - start_t > self.NR_TIGHTEN_TIMEOUT:
+                return "NG", "체결 통신 타임아웃 (회전 지속)", True
+
+            time.sleep(0.02)
 
     # 1-2. 물리적 체결 동작 (NR: Nut Runner 제어)
+    # ★ [PATCH] 순서 변경: 공압 ON → START → RUN(회전) 확인 → 실린더 하강 → 결과 감시
+    #   기존: START(50ms 큐 펄스)와 실린더 하강을 동시에 출력하고 회전 여부를 보지 않아
+    #         회전 없이 하강 → 5초 타임아웃 NG → 다음 위치로 넘어가는 문제가 있었습니다.
     def task_tightening(self, v_done, v_call, v_screw_working, 
                         mdo_nr_cyl_run, mdo_nr_start, mdo_nr_air_run, mdi_nr_down_chk, mdi_nr_up_chk,
                         mdi_nr_ok, mdi_nr_run, mdi_nr_ng, mdi_nr_err):
         
         print("[SEQ] 체결 동작 수행 시작 (Nut Runner)")
-        self.is_bolt_loaded = False
 
         self.set_variable_with_ui(v_done, 0)
         self.set_variable_with_ui(v_screw_working, 1) # 로봇 락(Lock)
         time.sleep(0.1)
 
-        print("[NR] 공압(진공) ON 및 스타트 펄스 전송")
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_air_run, 1))
-        time.sleep(0.1) 
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_start, 1))
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_cyl_run, 1))
-        time.sleep(0.05) 
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_start, 0))
-
         res = "NONE"
         reason = ""
+        nr_may_still_run = False
 
-        # ==============================================================
-        # [조건 1] 하강 자체가 실패한 경우 (시간 초과)
-        # ==============================================================
-        if not self.wait_for_input(mdi_nr_down_chk, 1, 1.5, "너트러너 하강 완료"):
-            print("[NR] 너트러너 실린더 하강 실패 감지 -> NG 처리")
-            res = "NG"
-            reason = "실린더 오작동 (하강 실패)"
-            # 실린더가 안 내려갔으니 체결 루프를 건너뛰고 바로 후처리로 넘어감
-        else:
-            # 하강 성공했으므로 체결 진행 감시
-            print("[NR] 체결 프로세스 감시 중...")
-            start_t = time.time()
-            last_nr_run = -1 
-            
-            while True:
-                self.wait_check()
-                inp = self.io_module.Read_Input_Data()
-                
-                curr_run = inp[mdi_nr_run]
-                if curr_run != last_nr_run:
-                    last_nr_run = curr_run
-                
-                # ==============================================================
-                # [조건 2 & 3] 체결 OK 신호 수신 시 실린더 상태 교차 검증
-                # ==============================================================
-                if inp[mdi_nr_ok] == 1: 
-                    if inp[mdi_nr_down_chk] == 0:
-                        # 체결 OK가 떴지만 실린더 센서가 꺼져있음 (실린더 들림 등)
-                        res = "NG"
-                        reason = "실린더 오작동 (체결 중 들림)"
-                    else:
-                        # 완벽한 정상 체결
-                        res = "OK"
-                    break
-                
-                # ==============================================================
-                # [조건 4] 체결 NG 신호 수신 시 
-                # (실린더 하강 여부와 관계없이 NG코드가 더 중요하므로 통신 에러코드 우선)
-                # ==============================================================
-                if inp[mdi_nr_ng] == 1: 
-                    # query_nr_error_code가 "체결불량(NG) - 시간 초과" 등의 형태로 반환함
-                    error_msg = self.query_nr_error_code("NG")
-                    # 보기 깔끔하게 앞의 "체결불량(NG) - " 텍스트는 잘라내고 핵심만 저장
-                    if "-" in error_msg:
-                        reason = error_msg.split("-")[1].strip()
-                    else:
-                        reason = error_msg
-                        
-                    res = "NG"
-                    print(f"[NG 감지] 체결 실패, 지연 없이 다음 작업으로 넘어갑니다. (사유: {reason})")
-                    break
+        try:
+            # (0) 이전 사이클의 RUN이 남아 있으면 새 START가 무시되거나 오판되므로 먼저 확인
+            self._nr_wait_run_clear(mdi_nr_run, self.NR_RUN_CLEAR_TIMEOUT, "START 전")
 
-                if inp[mdi_nr_err] == 1:
-                    error_msg = self.query_nr_error_code("ERR")
-                    # ★ 에러 레벨을 "ERROR"가 아닌 "WARN"으로 발송 (비상정지 방지)
-                    self.report_alarm_signal.emit(f"너트러너 시스템 에러: {error_msg}", "WARN")
-                    self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_air_run, 0))
-                    self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_cyl_run, 0))
-                    self.set_variable_with_ui(v_screw_working, 0)
-                    raise Exception(f"Nutrunner System Error: {error_msg}")
-                
-                if time.time() - start_t > 5.0:
+            # (1) 공압(진공) ON
+            print("[NR] 공압(진공) ON")
+            self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_air_run, 1))
+            time.sleep(0.1)
+
+            # (2) START → RUN 확인 (확인 전에는 실린더를 내리지 않음)
+            run_state = self._nr_start_and_confirm_run(mdo_nr_start, mdi_nr_run, mdi_nr_err)
+
+            if run_state == "ERR":
+                error_msg = self.query_nr_error_code("ERR")
+                self.report_alarm_signal.emit(f"너트러너 시스템 에러: {error_msg}", "WARN")
+                raise Exception(f"Nutrunner System Error: {error_msg}")
+
+            if run_state == "NO_RUN":
+                reason = f"너트러너 회전 미시작 ({self.NR_START_ATTEMPTS}회 시도 모두 RUN 신호 없음)"
+                # 실린더를 내리지 않았으므로 볼트는 팁에 그대로 → is_bolt_loaded 유지
+                if self.NR_NO_RUN_STOP_JOB:
+                    # 다음 시작 시 기존 NR 초기화(배출) 시퀀스가 다시 돌도록 하여 잔류 볼트 제거
+                    self._is_first_boot_init_done = False
+                    # 3회 모두 실패 시 ERROR 알람 (부저/적색등, 수동 모드 전환)
+                    self.report_alarm_signal.emit(f"{reason} - 팁에 볼트가 남아 있습니다. 다음 시작 시 배출 시퀀스가 실행됩니다.", "ERROR")
+                    raise Exception(reason)
+                res = "NG"
+            else:
+                # (3) 회전 확인 후 실린더 하강
+                print("[NR] 회전 확인 → 실린더 하강")
+                self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_cyl_run, 1))
+
+                if not self.wait_for_input(mdi_nr_down_chk, 1, 1.5, "너트러너 하강 완료"):
+                    print("[NR] 너트러너 실린더 하강 실패 감지 -> NG 처리")
                     res = "NG"
-                    reason = "체결 통신 타임아웃"
-                    break
-                    
-                time.sleep(0.05)
-                
+                    reason = "실린더 오작동 (하강 실패)"
+                    nr_may_still_run = True
+                    # ★ 하강하지 못했으므로 볼트는 팁에 남아 있음 → is_bolt_loaded 유지 (이중 공급 방지)
+                else:
+                    # 볼트가 체결부에 닿았으므로 결과와 무관하게 소모된 것으로 처리
+                    self.is_bolt_loaded = False
+                    res, reason, nr_may_still_run = self._nr_monitor_tightening(
+                        mdi_nr_ok, mdi_nr_run, mdi_nr_ng, mdi_nr_err, mdi_nr_down_chk)
+
+        finally:
+            # 정상/예외 모두 출력 원복 (기존에는 wait_check 예외 시 실린더/공압이 켜진 채 남을 수 있었음)
+            for idx in (mdo_nr_start, mdo_nr_air_run, mdo_nr_cyl_run):
+                try:
+                    self.io_module.Send_que.put(self.io_module.Write_DO_Data(idx, 0))
+                except Exception:
+                    pass
+            try:
+                self.set_variable_with_ui(v_screw_working, 0) # 로봇 락 해제
+            except Exception as fe:
+                print(f"[WARN] {v_screw_working} 해제 실패: {fe}")
+
         print(f"[NR] 체결 결과: {res} (사유: {reason})")
 
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_air_run, 0))
-        self.io_module.Send_que.put(self.io_module.Write_DO_Data(mdo_nr_cyl_run, 0))
-        self.set_variable_with_ui(v_screw_working, 0) # 로봇 락 해제
-        
+        # NR이 아직 돌고 있을 수 있는 경우(하강 실패/타임아웃), 스스로 사이클을 끝낼 때까지 대기.
+        # 끝나지 않으면 다음 볼트 START가 무시되므로 작업 정지.
+        if nr_may_still_run:
+            self._nr_wait_run_clear(mdi_nr_run, self.NR_ABORT_IDLE_WAIT, "비정상 체결 후")
+
         # 상승 실패 시 물리적 충돌 위험이 있으므로 예외 발생(정지)
         if not self.wait_for_input(mdi_nr_up_chk, 1, 1.5, "너트러너 상승 완료"):
             raise Exception("너트러너 실린더 상승 센서 감지 실패")
@@ -4501,7 +4790,9 @@ class BOLT(QMainWindow):
             self.set_variable_with_ui(v_done, 1)
             sync_start_t = time.time()
             while True:
-                self.wait_check()
+                paused = self._wait_check_timed()
+                if paused > 0.05:
+                    sync_start_t += paused
                 current_call = self.get_variable_with_ui(v_call)
                 if str(current_call).lower() in ["false", "0", "none", ""]:
                     reset_retry = 0
@@ -4552,11 +4843,18 @@ class BOLT(QMainWindow):
                 # ==============================================================
                 # ★ [핵심] 로봇이 목적지에 도착해서 멈춘 이 순간! 볼트가 없다면 장전합니다.
                 # ==============================================================
+                feed_note = ""
                 if not getattr(self, 'is_bolt_loaded', False):
                     print(f"[{step_name}] 로봇 위치 도착 완료. 볼트 공급 시작...")
                     if not self.task_feed_bolt(mdo_sfd_start, mdi_sfd_bolt_detect, mdi_sfd_ready, mdi_sfd_err):
-                        print(f"[{step_name}] SFD 공급 실패로 인한 작업 중단")
+                        print(f"[{step_name}] SFD 에러/Ready 불가로 인한 작업 중단")
                         return False, failed_bolts, bolt_index
+                    # ★ [PATCH] 미감지여도 멈추지 않고 체결 시도 → 결과가 NG면 사유에 표시
+                    feed_status = getattr(self, '_last_feed_status', None)
+                    if feed_status == "NOT_DETECTED":
+                        feed_note = "볼트 공급 미감지"
+                    elif feed_status == "EXTRA_PULSE_SKIP":
+                        feed_note = "예상 밖 볼트 통과로 공급 생략"
 
                 # 볼트 장전 성공 시 체결 시작
                 bolt_index += 1
@@ -4568,7 +4866,12 @@ class BOLT(QMainWindow):
                 
                 # 체결 결과 판별 및 기록
                 if res == "NG":
-                    failed_bolts.append(f"{bolt_index} ({reason})")
+                    full_reason = f"{feed_note} / {reason}" if feed_note else reason
+                    failed_bolts.append(f"{bolt_index} ({full_reason})")
+                    print(f"[{step_name}] {bolt_index}번 NG 기록 - 작업 계속 진행 (종료 후 수동 체결)")
+                elif feed_note:
+                    print(f"[{step_name}] {bolt_index}번: {feed_note} 상태였으나 체결 {res} "
+                          f"(센서가 통과를 놓친 것으로 판단)")
             
             # ★ 기존에 있던 "elif not getattr(self, 'is_bolt_loaded', False):" 
             # (이동 중 볼트를 미리 쏘는 로직) 전체를 삭제했습니다!
@@ -4587,7 +4890,7 @@ class BOLT(QMainWindow):
                 self.actual_joint_wrist3
             ]
             
-            raw_wp = self.robot_29999.get_variable(var_name)
+            raw_wp = self.robot_29999.get_variable_cached(var_name)   # ★ [PATCH] 캐시
             
             if raw_wp is None or raw_wp == "NOT_FOUND":
                 return False
@@ -4665,7 +4968,8 @@ class BOLT(QMainWindow):
                                             mdi_jig_clamp_chk_1, mdi_jig_clamp_chk_2,
                                             mdo_jig_adv, mdo_jig_ret, mdi_jig_adv_chk, 
                                             mdo_sensor_reset, mdo_sensor_mute_a, mdo_sensor_mute_b, mdi_prod_detect_sen, mdi_prod_pos_sen):
-            return "ERROR", []
+            # ★ [PATCH] job_head는 4개 값을 언패킹하므로 2개 반환 시 ValueError 발생
+            return "ERROR", [], f"Cell {target_cell} 지그 고정 실패 (제품/클램프/인터락 확인)", time.time() - start_t
 
         # -------------------------------------------------------------
         # 3. [로봇 권한 획득] 
@@ -4677,7 +4981,7 @@ class BOLT(QMainWindow):
                 self.cleanup_cell(target_cell, var_start,
                                   mdo_jig_adv, mdo_jig_ret, mdi_jig_ret_chk,
                                   mdo_jig_clamp, mdi_jig_unclamp_chk_1, mdi_jig_unclamp_chk_2)
-                return "ERROR", []
+                return "ERROR", [], "로봇 권한 대기 중 알람/오토 해제", time.time() - start_t
             
             is_home_val = self.get_variable_with_ui("is_home")
             is_home_true = (str(is_home_val).lower() == "true" or is_home_val == 1 or is_home_val is True)
@@ -4699,6 +5003,7 @@ class BOLT(QMainWindow):
         
         # ★ [수정] 시작할 때는 팁에 볼트가 없다고 명시 (선행 공급 로직 삭제됨)
         self.is_bolt_loaded = False 
+        self._sfd_sync_mark()   # ★ [PATCH] 작업 전(배출/수동 조작) 펄스는 제외하고 새로 카운트
         
         try:
             # (1) 로봇 출발 및 Handshaking (선행 공급 코드가 이 위치에서 삭제되었습니다)
@@ -5044,7 +5349,8 @@ class BOLT(QMainWindow):
                                             mdo_jig_left_adv, mdo_jig_right_adv,
                                             mdi_jig_left_1_adv, mdi_jig_left_2_adv,
                                             mdi_jig_right_1_adv, mdi_jig_right_2_adv):
-            return "ERROR", []
+            # ★ [PATCH] job_back은 4개 값을 언패킹하므로 2개 반환 시 ValueError 발생
+            return "ERROR", [], "BACK 지그 고정 실패 (제품/지그/인터락 확인)", time.time() - start_t
 
         # -------------------------------------------------------------
         # 3. [로봇 권한 획득] 
@@ -5059,7 +5365,7 @@ class BOLT(QMainWindow):
                                   mdi_jig_right_1_ret, mdi_jig_right_2_ret, 
                                   mdi_jig_anti_rot_ret, mdi_rot_home_chk,
                                   mdi_jig_unclamp_chk_1, mdi_jig_unclamp_chk_2)
-                return "ERROR", []
+                return "ERROR", [], "로봇 권한 대기 중 알람/오토 해제", time.time() - start_t
 
             is_home_val = self.get_variable_with_ui("is_home")
             is_home_true = (str(is_home_val).lower() == "true" or is_home_val == 1 or is_home_val is True)
@@ -5077,6 +5383,7 @@ class BOLT(QMainWindow):
 
         # ★ [수정] 시작할 때는 팁에 볼트가 없다고 명시 (선행 공급 로직 삭제됨)
         self.is_bolt_loaded = False 
+        self._sfd_sync_mark()   # ★ [PATCH] 작업 전(배출/수동 조작) 펄스는 제외하고 새로 카운트
 
         try:
             # (1) Work 1 (전면) - 선행 공급 코드 삭제됨
@@ -5433,10 +5740,10 @@ class BOLT(QMainWindow):
                 self.actual_joint_wrist3
             ]
             
-            home_joints = self.robot_29999.get_variable("J_home")
+            home_joints = self.robot_29999.get_variable_cached("J_home")   # ★ [PATCH] 캐시
             
-            if home_joints is None or home_joints == "NOT_FOUND":
-                print("[ERROR] J_home 변수를 가져올 수 없습니다.") 
+            if not isinstance(home_joints, list):
+                print(f"[ERROR] J_home 변수를 가져올 수 없습니다. (수신값: {home_joints})") 
                 return False
 
             if len(home_joints) != 6:
@@ -5451,7 +5758,7 @@ class BOLT(QMainWindow):
             
             is_home_val = self.get_variable_with_ui("is_home")
             
-            if str(is_home_val).lower() != "true":
+            if str(is_home_val).lower() not in ("true", "1"):   # ★ [PATCH] 1도 허용 (다른 곳과 판정 통일)
                 # print(f"[Check] is_home 변수가 True가 아님: {is_home_val}")
                 return False
 
@@ -5510,7 +5817,10 @@ class BOLT(QMainWindow):
             
             # 여기서 발송되는 알람 로그가 우측 하단 에러 리스트에도 쌓입니다.
             alarm_str = f"[{cell_name}] 작업 비정상 종료 (사유: {error_msg})"
-            if not self.is_alarm_state() and not getattr(self, '_is_software_error', False):
+            if getattr(self, '_user_stop_requested', False):
+                # ★ [PATCH] 정지 버튼/알람 리셋으로 인한 협조적 종료는 알람을 다시 띄우지 않음
+                print(f"[INFO] {alarm_str} - 사용자 정지/리셋에 의한 종료")
+            elif not self.is_alarm_state() and not getattr(self, '_is_software_error', False):
                 self.report_alarm_signal.emit(alarm_str, "ERROR")
             
             if self.waiting_cell is not None:
@@ -5622,9 +5932,9 @@ class BOLT(QMainWindow):
             # failed_bolts 예시: "1 (1차 토크 미달)"
             for fb in failed_bolts:
                 if "(" in fb and ")" in fb:
-                    parts = fb.split("(")
+                    parts = fb.split("(", 1)   # ★ [PATCH] 사유에 괄호가 있어도 잘리지 않도록
                     ng_positions.append(parts[0].strip() + "번")
-                    ng_reasons.append(parts[1].replace(")", "").strip())
+                    ng_reasons.append(parts[1].rsplit(")", 1)[0].strip())
                 else:
                     ng_positions.append(fb)
                     ng_reasons.append("체결 불량")
@@ -6397,7 +6707,7 @@ class BOLT(QMainWindow):
     def get_variable_with_ui(self, var_name):
         # J_home은 배열 데이터이므로 기존 29999 포트 유지
         if var_name == "J_home":
-            value = self.robot_29999.get_variable(var_name)
+            value = self.robot_29999.get_variable_cached(var_name)   # ★ [PATCH] 캐시
         else:
             # 캐싱된 Modbus 데이터(OUTPUT)에서 읽기
             value = self.cached_robot_vars.get(var_name, 0)
@@ -6909,8 +7219,8 @@ class BOLT(QMainWindow):
                 ]
                 
                 # 로봇에 저장된 J_home 데이터 호출
-                raw_home = self.robot_29999.get_variable("J_home")
-                home_joints = ast.literal_eval(raw_home) if isinstance(raw_home, str) else raw_home
+                raw_home = self.robot_29999.get_variable_cached("J_home")   # ★ [PATCH] 캐시
+                home_joints = raw_home if isinstance(raw_home, list) else None
                 
                 # 현재 위치와 J_home의 오차가 0.05 라디안(약 2.8도) 이내인지 확인
                 if isinstance(home_joints, list) and len(home_joints) == 6:
@@ -7171,43 +7481,81 @@ class BOLT(QMainWindow):
         script = f"def m():\n    {cmd}end\n"
         self.robot_30001.send_command(script)
 
+    # ★ [PATCH] 수동 이동 도착 판정 설정
+    MANUAL_JOINT_TOL  = 0.02    # [rad] moveJ 도착 판정 (관절별 최대 오차)
+    MANUAL_TCP_TOL    = 0.003   # [m]   moveL 도착 판정 (XYZ 거리)
+    MANUAL_VERIFY_TCP = True    # moveL 목표 변수와 30001 TCP 좌표의 단위/좌표계가 다르면 False로
+
     def send_moveL_and_wait(self, target_pose, a=1.2, v=0.5, timeout=20.0):
         if getattr(self, 'auto_mode', False) or self.is_alarm_state():
             return False
         print(f"[INFO] moveL_wait started")
+        self._manual_abort = False
         self.send_moveL(target_pose, a, v)
-        # 선형 이동은 조인트 비교 없이 상태와 타임아웃만으로 판단
-        return self._wait_for_motion_complete(target_joints=None, timeout=timeout)
+        tcp = target_pose if self.MANUAL_VERIFY_TCP else None
+        return self._wait_for_motion_complete(target_tcp=tcp, timeout=timeout)
 
     def send_moveJ_and_wait(self, target_pose_j, a=1.4, v=1.1, timeout=20.0):
         if getattr(self, 'auto_mode', False) or self.is_alarm_state():
             return False
         print(f"[INFO] moveJ_wait started")
+        self._manual_abort = False
         self.send_moveJ(target_pose_j, a, v)
-        # 관절 이동은 현재 관절 각도와 비교하여 즉시 도착을 판별
         return self._wait_for_motion_complete(target_joints=target_pose_j, timeout=timeout)
 
-    def _wait_for_motion_complete(self, target_joints=None, timeout=20.0, pos_tol=0.05):
-        """프리징을 방지하며 로봇의 이동 완료를 대기합니다."""
+    def _motion_target_error(self, target_joints=None, target_tcp=None):
+        """(도착 여부, 오차 설명 문자열) 반환. 목표가 없으면 (None, '')"""
+        if target_joints:
+            cur = self.get_current_joints()
+            err = max(abs(c - t) for c, t in zip(cur, target_joints))
+            return err <= self.MANUAL_JOINT_TOL, f"관절 최대오차 {err:.4f} rad"
+        if target_tcp:
+            cur = getattr(self, 'actual_tcp', None)
+            if not cur:
+                return False, "TCP 좌표 없음"
+            dist = sum((c - t) ** 2 for c, t in zip(cur[:3], target_tcp[:3])) ** 0.5
+            return dist <= self.MANUAL_TCP_TOL, f"TCP 거리오차 {dist * 1000:.1f} mm"
+        return None, ""
+
+    def _pump_state_updates(self, duration=0.3):
+        """GUI 스레드에서 대기하는 동안 poll 타이머가 돌아 관절/TCP 값이 갱신되도록 이벤트 처리"""
+        end_t = time.time() + duration
+        while time.time() < end_t:
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+    def _wait_for_motion_complete(self, target_joints=None, target_tcp=None, timeout=20.0):
+        """
+        ★ [PATCH] 이동 완료 판정 강화
+          - 2초 내 모션 시작 미감지: 이미 목표 위치가 아니면 '실패' (기존: 무조건 '도착' 처리)
+          - 모션 정지 후 목표 위치 검증: 정지 버튼/보호정지로 중간에 멈춘 경우 '실패'
+            (기존: running=False면 무조건 '도착' → 다음 웨이포인트를 전송해 경유점을 건너뜀)
+          - 정지 버튼 플래그(_manual_abort) 확인
+        """
         start_time = time.time()
         motion_started = False
-        
-        # J명령일 경우, 이미 목적지 근처라면 즉시 성공 처리 (0.05 라디안 오차 허용)
-        if target_joints:
-            cur_j = self.get_current_joints()
-            dist = sum(abs(c - t) for c, t in zip(cur_j, target_joints))
-            if dist < pos_tol:
-                print(f"[INFO] 이미 목적지에 위치함. (오차: {dist:.4f})")
-                return True
+
+        at_target, info = self._motion_target_error(target_joints, target_tcp)
+        if at_target:
+            print(f"[INFO] 이미 목적지에 위치함. ({info})")
+            return True
 
         while True:
             # ★ 핵심: 무한 루프 중에도 UI가 멈추지 않도록 이벤트 강제 펌핑
             QApplication.processEvents()
-            
+
+            if getattr(self, '_manual_abort', False):
+                print("[INFO] 정지 버튼 → 이동 대기 중단 (실패 처리)")
+                return False
+
             # 안전 검사 (수동 모드 해제 시, 알람 시 즉시 중단)
             if getattr(self, 'auto_mode', False) or self.is_alarm_state():
                 print("[INFO] 작업 모드 변경 또는 알람 -> 이동 대기 취소")
                 self.robot_29999.robot_stop()
+                return False
+
+            if getattr(self, 'robot_disconnected', True):
+                print("[ERROR] 로봇 연결 끊김 -> 이동 대기 취소")
                 return False
                 
             # 일시 정지 시 무한 대기 (이때도 UI는 살려둠)
@@ -7215,6 +7563,8 @@ class BOLT(QMainWindow):
                 print("[INFO] 이동 중 일시 정지됨...")
                 while not self.pause_event.is_set():
                     QApplication.processEvents()
+                    if getattr(self, '_manual_abort', False):
+                        return False
                     time.sleep(0.1)
                 print("[INFO] 일시 정지 해제 -> 이동 재개")
                 start_time = time.time()
@@ -7224,23 +7574,33 @@ class BOLT(QMainWindow):
                 self.robot_29999.robot_stop()
                 return False
                 
-            # 로봇 상태 검사
             running = getattr(self, 'is_task_running', False)
             
             if not motion_started:
                 if running:
                     motion_started = True
                     print("[INFO] 로봇 모션 시작됨.")
-                else:
-                    # 2초 이상 지났는데 running이 뜨지 않는다면 명령 무시됐거나 아주 짧게 이동한 것
-                    if time.time() - start_time > 2.0:
-                        print("[INFO] 모션 시작 미감지. 이미 도착한 것으로 간주합니다.")
+                elif time.time() - start_time > 2.0:
+                    self._pump_state_updates(0.3)
+                    at_target, info = self._motion_target_error(target_joints, target_tcp)
+                    if at_target:
+                        print(f"[INFO] 짧은 이동으로 시작 미감지, 목표 위치 확인됨 ({info})")
                         return True
+                    print(f"[ERROR] 모션 시작 미감지 - 이동 명령이 실행되지 않았습니다. ({info})")
+                    return False
             else:
                 if not running:
-                    print("[INFO] ✓ 모션 정지(도착) 확인 완료.")
-                    time.sleep(0.2) # 관절 진동 안정화
-                    return True
+                    # 관절 진동 안정화 + 최신 상태 수신
+                    self._pump_state_updates(0.3)
+                    at_target, info = self._motion_target_error(target_joints, target_tcp)
+                    if at_target is None:
+                        print("[INFO] ✓ 모션 정지 확인 (목표 좌표 검증 생략)")
+                        return True
+                    if at_target:
+                        print(f"[INFO] ✓ 모션 정지(도착) 확인 완료. ({info})")
+                        return True
+                    print(f"[ERROR] 목표 도달 전에 모션이 정지했습니다. ({info})")
+                    return False
                     
             time.sleep(0.05)
             

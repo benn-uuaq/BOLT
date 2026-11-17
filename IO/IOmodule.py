@@ -14,6 +14,10 @@ class IO_Module_Class(QThread):
         self.Read_DI = [0] * 48
         self.Read_DO = [0] * 48
 
+        # ★ [PATCH] 연결 상태 판정용: 마지막으로 입력 읽기에 성공한 시각
+        #   (읽기 실패 시 Read_DI는 이전 값을 유지하므로 값만 봐서는 끊김을 알 수 없음)
+        self.last_ok_time = 0.0
+
         # auto_open=True 이므로 수동으로 open() 할 필요 없이 알아서 연결 관리됨
         self.IO_Module = ModbusClient(host=IP, port=Port, timeout=1.0, auto_open=True)
         self.Input_Address = 0x07D0  # 2000
@@ -22,6 +26,10 @@ class IO_Module_Class(QThread):
     def Read_Input_Data(self):
         """MDI 리스트 반환 (메인 스레드에서 UI 업데이트 시 호출)"""
         return self.Read_DI
+
+    def is_connected(self, timeout=1.5):
+        """★ [PATCH] 최근 timeout초 안에 입력 읽기에 성공했으면 연결된 것으로 판단"""
+        return (not self.stop_signal) and (time.time() - self.last_ok_time) < timeout
 
     def Read_Output_Data(self):
         """MDO 리스트 반환 (메인 스레드에서 UI 업데이트 시 호출)"""
@@ -53,6 +61,7 @@ class IO_Module_Class(QThread):
                 di_data = self.IO_Module.read_discrete_inputs(self.Input_Address, 48)
                 if di_data: 
                     self.Read_DI = di_data
+                    self.last_ok_time = time.time()   # ★ [PATCH] 연결 상태 갱신
                 
                 # 3. MDO (출력) 상태 읽기 (피드백용)
                 do_data = self.IO_Module.read_coils(self.Output_Address, 48)

@@ -14,7 +14,7 @@ PORT1 = 29999
 PORT2 = 30001
 PORT3 = 502
 
-PC_IP = "192.168.1.100"
+PC_IP = "192.168.1.150"
 PC_PORT = 30010
 
 DEFAULT_TIMEOUT = 10.0
@@ -113,6 +113,43 @@ class RobotDataConfig():
                    sum(e[1] if isinstance(e, tuple) else 1 for e in self.names_post))
         if n_fields != n_names:
             raise ValueError(f"[RobotDataConfig] 필드 수({n_fields})와 이름 수({n_names}) 불일치")
+
+        # ★ [PATCH] 서브패키지(길이+타입) 단위 정의
+        #   기존에는 패킷이 정확히 1157바이트일 때만 해석되어, 로봇 펌웨어가 바뀌어
+        #   서브패키지가 추가되거나 길어지면 상태 데이터를 전혀 못 읽었습니다.
+        #   (key, 포맷(서브헤더 'IB' 포함), 이름 목록, 필수 여부, 표준 타입 ID)
+        post_groups = []
+        for entry in self.names_post:
+            if isinstance(entry, str) and entry.endswith('_sub_len'):
+                post_groups.append([])
+            post_groups[-1].append(entry)
+        cart_n, cfg_n, mb_n, add_n, tool_n, safe_n, tc_n = post_groups
+
+        self.sections = [
+            ("MODE",   '>' + FMT_ROBOT_MODE,                           self.names_pre[2:21], True,  0),
+            ("JOINT",  '>' + FMT_JOINT_HEADER + FMT_JOINT_DATA * 6,    None,                 True,  1),
+            ("CART",   '>' + FMT_CARTESIAN,                            cart_n,               True,  4),
+            ("CONFIG", '>' + FMT_CONFIG,                               cfg_n,                False, 6),
+            ("MB",     '>' + FMT_MASTERBOARD,                          mb_n,                 False, 3),
+            ("ADD",    '>' + FMT_ADDITIONAL,                           add_n,                False, 8),
+            ("TOOL",   '>' + FMT_TOOL,                                 tool_n,               False, 2),
+            ("SAFETY", '>' + FMT_SAFETY,                               safe_n,               False, 10),
+            ("TCOMM",  '>' + FMT_TOOL_COMM,                            tc_n,                 False, 11),
+        ]
+        self.section_size = {k: struct.calcsize(f) for k, f, _, _, _ in self.sections}
+        self.total_size = struct.calcsize(self.fmt)   # 기존 구조 전체 길이 (1157)
+
+        # 이름 수 ↔ 포맷 필드 수 검증 (JOINT는 헤더 2 + 12*6)
+        for k, f, names, _, _ in self.sections:
+            n_f = len(struct.unpack(f, bytes(struct.calcsize(f))))
+            n_n = (2 + len(self.names_joint) * 6) if names is None else \
+                  sum(e[1] if isinstance(e, tuple) else 1 for e in names)
+            if n_f != n_n:
+                raise ValueError(f"[RobotDataConfig] {k} 섹션 필드 수({n_f})와 이름 수({n_n}) 불일치")
+
+        # 모든 이름 목록 (섹션이 빠졌을 때 기본값 None 을 채우기 위함)
+        self.all_names = (list(self.names_pre) + list(self.names_joint) +
+                          [e[0] if isinstance(e, tuple) else e for e in self.names_post])
 # ----------- RobotData for Elite CS robots -------------
 
 class RobotHeader():
@@ -124,47 +161,137 @@ class RobotHeader():
         return rmd
 
 class RobotData():
+    """
+    ★ [PATCH] 상태 패킷(type 16)을 서브패키지 단위로 잘라서 해석합니다.
+      - 서브패키지 = [길이(4) + 타입(1) + 데이터]
+      - 모르는 서브패키지가 추가된 경우 → 건너뜀
+      - 기존 서브패키지가 길어진 경우 → 앞부분(기존 구조)만 사용
+      - 로봇 모드 / 관절 / TCP 좌표만 있으면 동작 (나머지는 없으면 None)
+    """
+    # 실제로 들어온 서브패키지 타입 ID를 학습한 결과 (key -> type)
+    learned_types = None
+
     @staticmethod
-    def unpack(buf, config):
-        data = RobotData()
-        
-        try:
-            # 1. 전체 데이터 한 번에 언팩 (포맷 길이 검증 포함)
-            unpacked = struct.unpack(config.fmt, buf)
-            
-            # 2. 이터레이터 생성 (하나씩 뽑아쓰기 위해)
-            it = iter(unpacked)
-            
-            # [A] 관절 앞부분 매핑
-            for name in config.names_pre:
-                setattr(data, name, next(it))
-            
-            # [B] 관절 데이터 매핑 (리스트로 초기화 후 6번 반복)
-            # 먼저 관절 변수들을 빈 리스트로 생성
+    def split_subpackages(buf):
+        """반환: [(sub_type, chunk_bytes), ...], 잘린 꼬리 바이트 수"""
+        subs = []
+        total = len(buf)
+        off = 5  # 전체 헤더(길이 4 + 타입 1)
+        while off + 5 <= total:
+            sub_len = struct.unpack_from('>I', buf, off)[0]
+            sub_type = buf[off + 4]
+            if sub_len < 5 or off + sub_len > total:
+                break
+            subs.append((sub_type, buf[off:off + sub_len]))
+            off += sub_len
+        return subs, total - off
+
+    @staticmethod
+    def _apply_section(data, config, key, fmt, names, chunk):
+        vals = struct.unpack_from(fmt, chunk)
+        it = iter(vals)
+        if key == "JOINT":
+            setattr(data, 'joint_sub_len', next(it))
+            setattr(data, 'joint_sub_type', next(it))
             for name in config.names_joint:
                 setattr(data, name, [])
-                
-            # 6번 반복하며 데이터 채우기
             for _ in range(6):
                 for name in config.names_joint:
-                    val = next(it)
-                    getattr(data, name).append(val)
-            
-            # [C] 관절 뒷부분 매핑 (나머지 전부) - (이름, 개수) 튜플은 리스트로 저장
-            for entry in config.names_post:
-                if isinstance(entry, tuple):
-                    name, cnt = entry
-                    setattr(data, name, [next(it) for _ in range(cnt)])
-                else:
-                    setattr(data, entry, next(it))
-                
+                    getattr(data, name).append(next(it))
+            return
+        for entry in names:
+            if isinstance(entry, tuple):
+                name, cnt = entry
+                setattr(data, name, [next(it) for _ in range(cnt)])
+            else:
+                setattr(data, entry, next(it))
+
+    @staticmethod
+    def unpack(buf, config, report=None):
+        """
+        report: dict 를 넘기면 해석 상태를 채워줍니다.
+                report['status'] = "OK" / "CHANGED" / "FAIL", report['detail'] = 설명
+        """
+        rep = report if report is not None else {}
+        try:
+            subs, tail = RobotData.split_subpackages(buf)
+            if not subs:
+                rep.update(status="FAIL", detail=f"서브패키지 없음 (패킷 {len(buf)}B)")
+                return None
+
+            sections = config.sections
+            sizes = config.section_size
+
+            # (1) 기존 구조와 완전히 같은지 (개수/순서/길이) → 타입 ID 학습
+            exact = (len(buf) == config.total_size and len(subs) == len(sections) and
+                     all(len(c) == sizes[k] for (_, c), (k, *_r) in zip(subs, sections)))
+            if exact:
+                RobotData.learned_types = {k: t for (t, _), (k, *_r) in zip(subs, sections)}
+
+            # (2) 타입 ID → 섹션 매핑 (학습값 우선, 없으면 표준 ID)
+            if RobotData.learned_types:
+                type_to_key = {t: k for k, t in RobotData.learned_types.items()}
+            else:
+                type_to_key = {std: k for k, _f, _n, _req, std in sections}
+
+            found = {}
+            unknown = []
+            for t, chunk in subs:
+                k = type_to_key.get(t)
+                if k is None or k in found:
+                    unknown.append((t, len(chunk)))
+                    continue
+                found[k] = chunk
+
+            # (3) 타입으로 하나도 못 찾으면 순서 기반으로 대응 (구조가 크게 다를 때 최후 수단)
+            by_order = False
+            if not found:
+                by_order = True
+                for (t, chunk), (k, *_r) in zip(subs, sections):
+                    found[k] = chunk
+
+            data = RobotData()
+            for name in config.all_names:
+                setattr(data, name, None)
+            data.total_message_len = struct.unpack_from('>i', buf, 0)[0]
+            data.total_message_type = buf[4]
+
+            missing, longer, shorter = [], [], []
+            for k, fmt, names, required, _std in sections:
+                chunk = found.get(k)
+                if chunk is None:
+                    missing.append(k)
+                    if required:
+                        rep.update(status="FAIL", detail=f"필수 섹션 {k} 없음 / 수신 서브패키지 "
+                                   f"{[(t, len(c)) for t, c in subs]}")
+                        return None
+                    continue
+                if len(chunk) < sizes[k]:
+                    shorter.append(f"{k}({len(chunk)}<{sizes[k]})")
+                    if required:
+                        rep.update(status="FAIL", detail=f"필수 섹션 {k} 길이 부족 "
+                                   f"({len(chunk)}B < {sizes[k]}B)")
+                        return None
+                    continue
+                if len(chunk) > sizes[k]:
+                    longer.append(f"{k}({len(chunk)}>{sizes[k]})")
+                RobotData._apply_section(data, config, k, fmt, names, chunk)
+
+            if exact:
+                rep.update(status="OK", detail=f"{len(buf)}B, 서브패키지 {len(subs)}개")
+            else:
+                parts = [f"패킷 {len(buf)}B(기존 {config.total_size}B)"]
+                if by_order: parts.append("타입 불일치로 순서 기준 해석")
+                if unknown:  parts.append(f"추가/미확인 서브패키지(type,len) {unknown}")
+                if longer:   parts.append(f"길어짐 {longer}")
+                if shorter:  parts.append(f"짧아서 제외 {shorter}")
+                if missing:  parts.append(f"없음 {missing}")
+                if tail:     parts.append(f"잘린 꼬리 {tail}B")
+                rep.update(status="CHANGED", detail=", ".join(parts))
             return data
 
-        except struct.error:
-            # 버퍼 크기가 부족하거나 포맷이 안 맞을 경우
-            return None
-        except StopIteration:
-            # 데이터가 중간에 끊겼을 경우
+        except (struct.error, StopIteration, IndexError) as e:
+            rep.update(status="FAIL", detail=f"{type(e).__name__}: {e} (패킷 {len(buf)}B)")
             return None
     
 class AlarmData:
@@ -208,6 +335,7 @@ class Robot_30001():
         self.port2 = port2
         self.__sock = None
         self.__buf = b""
+        self._parse_reported = None   # ★ [PATCH] 해석 상태 로그 1회 출력용
         
         self.alarm_queue = queue.Queue()
 
@@ -220,6 +348,7 @@ class Robot_30001():
             self.__sock.settimeout(10.0) 
             print(f"Connected to {self.ip} on port {self.port2}")
             self.__buf = b""
+            self._parse_reported = None
             return self.__sock
         except Exception as e:
             print(f"Error connecting to {self.ip} on port {self.port2}: {e}")
@@ -289,12 +418,30 @@ class Robot_30001():
             # 상태 패킷 처리 (가장 최신 것만 last_valid_data에 저장)
             if head.type == MESSAGE_TYPE_ROBOT_STATE:
                 try:
-                    last_valid_data = RobotData.unpack(payload, self.__data_config)
-                except:
-                    pass
+                    report = {}
+                    parsed = RobotData.unpack(payload, self.__data_config, report)
+                    if parsed is not None:
+                        last_valid_data = parsed
+                    self._report_parse(report)
+                except Exception as e:
+                    self._report_parse({"status": "FAIL", "detail": f"{type(e).__name__}: {e}"})
 
         # 반복문이 끝나면 가장 최신 데이터만 반환 (랙 방지 핵심)
         return last_valid_data
+
+    def _report_parse(self, report):
+        """★ [PATCH] 해석 상태가 바뀔 때만 1회 출력 (로그 도배 방지)"""
+        status = report.get("status")
+        if status is None or status == self._parse_reported:
+            return
+        self._parse_reported = status
+        detail = report.get("detail", "")
+        if status == "OK":
+            print(f"[30001] 상태 패킷 구조 정상 ({detail})")
+        elif status == "CHANGED":
+            print(f"[30001 WARN] 상태 패킷 구조가 기존과 다름 - 동작은 합니다: {detail}")
+        else:
+            print(f"[30001 ERROR] 상태 패킷 해석 실패 - 로봇 상태/관절값이 갱신되지 않습니다: {detail}")
 
     def __read_socket_no_wait(self):
         """

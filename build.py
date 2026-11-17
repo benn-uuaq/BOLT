@@ -52,11 +52,18 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=my_datas,
-    hiddenimports=['serial', 'pyserial', 'PyQt5'],
+    hiddenimports=['serial', 'PyQt5'],   # 'pyserial'은 패키지명(모듈명은 serial)이라 제거
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 이 PC에 설치된 다른 Qt 바인딩/대형 패키지가 딸려 들어오는 것 차단
+    # (PyQt5 + PySide6 동시 수집 시 PyInstaller가 빌드를 중단함)
+    excludes=[
+        'PySide6', 'PySide2', 'PyQt6', 'shiboken6', 'shiboken2',
+        'torch', 'torchvision', 'torchaudio', 'tensorflow', 'tensorboard',
+        'IPython', 'jedi', 'parso', 'zmq', 'nbformat', 'jupyter', 'jupyter_client', 'ipykernel', 'notebook',
+        'tkinter', '_tkinter',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

@@ -137,7 +137,7 @@ class RobotDB:
             cursor.execute("""
                 INSERT OR REPLACE INTO connection (IP_name, IP, PORT)
                 VALUES (?, ?, ?)
-            """, (name, str(ip), int(port)))
+            """, (name, str(ip).strip(), int(port)))   # ★ [PATCH] 앞뒤 공백 제거 후 저장
             conn.commit()
             print(f"[DB] 연결 정보 저장: {name} | {ip}:{port}")
         except Exception as e:
@@ -157,7 +157,9 @@ class RobotDB:
             cursor.execute("SELECT IP, PORT FROM connection WHERE IP_name = ?", (name,))
             row = cursor.fetchone()
             if row:
-                return row[0], row[1] # (IP, PORT)
+                # ★ [PATCH] 예전에 공백이 섞여 저장된 값도 정리해서 반환
+                ip = row[0].strip() if isinstance(row[0], str) else row[0]
+                return ip, row[1] # (IP, PORT)
             return None, None
         except Exception as e:
             print(f"[DB] 연결 정보 로드 실패: {e}")

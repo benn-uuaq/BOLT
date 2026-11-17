@@ -1,0 +1,29 @@
+====================================
+ 시스템 전체 로그 백업 시점: 2026-09-29 11:00:09
+====================================
+
+[SYSTEM] 제품 적용 완료: IG (MDO 37:0, MDO 38:0)
+[INIT] Sequence 맵핑 JSON 로드 완료
+[UI] HEAD IO 라벨 적용 완료
+[UI] 로봇 변수 테이블 초기화 완료
+[System] 백그라운드 자동 연결 시작...
+[Network] 접속 대상 - 로봇 192.168.1.101:29999/30001, Modbus 192.168.1.101:502, IO 192.168.2.202:502
+[IO Thread] 종료됨
+[IO Thread] 백그라운드 통신 시작됨
+Connected to 192.168.1.101 on port 29999
+Connected to 192.168.1.101 on port 30001
+[PC Modbus Client] 로봇 서버(192.168.1.101:502, ID:255)에 코일 통신 연결 시도 중...
+[PC Modbus Client] 로봇 서버 접속 성공!
+[INFO] 로봇 연결 성공 (192.168.1.101)
+[INFO] 로봇 연결 성공
+[UI] 로봇 변수 테이블 초기화 완료
+[INFO] 알람 감지 스레드 시작됨
+[INIT CHECK] 현재 로봇 SafetyMode: VIOLATION
+[INIT ALARM] 로봇 안전 에러 상태 발견됨! -> VIOLATION
+[Modbus Write Coil] system_NG (Addr: 300) = True
+[ALARM STOP] 시스템 에러로 인한 너트러너 정지 요청 (MDO 34 ON)
+[30001] 상태 패킷 구조 정상 (1157B, 서브패키지 9개)
+[SYNC] Speed synced: 100.0%
+[SYSTEM] 제품 적용 완료: IG (MDO 37:0, MDO 38:0)
+[RESET] 알람 리셋 시퀀스 시작 (안전 릴레이 1초 펄스 적용)
+[LOG] 알람 내역이 텍스트 파일로 백업되었습니다. (D:\RND_WORK\AEK_JKN_볼트 자동 체결기\bolt_python_20260929\Logs\Alarm_Log_20260929.txt)

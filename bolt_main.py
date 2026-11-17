@@ -14,6 +14,9 @@ import threading
 import ctypes
 import serial
 import sqlite3
+import socket
+import ipaddress
+import unicodedata
 from pathlib import Path
 
 from PyQt5.QtWidgets import *
@@ -558,6 +561,7 @@ class BoltPurgeThread(QThread):
                 # =========================================================================
 
                 print(f"[PURGE] 배출 {cycle_cnt}회차 (미감지 누적: {sfd_miss_cnt}/3) - 피더기 Ready 승인. 슈팅 실행.")
+                time.sleep(0.1)   # ★ Ready 감지 후 0.1s 대기 후 슈팅
                 
                 # (1) 피더기 슈팅 (SFD Start MDO 43)
                 self.main._bolt_detect_latched = False # 쏠 때마다 센서 메모리 초기화
@@ -940,11 +944,20 @@ class ConnectionThread(QThread):
 
             # 3. ★ [추가] IO 모듈 (TCP 포트 연결 테스트)
             io_ok = False
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0) # 1초 대기
-                if s.connect_ex((self.io_ip, self.io_port)) == 0:
-                    io_ok = True
+            io_err = ""
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.0) # 1초 대기
+                    rc = s.connect_ex((self.io_ip, self.io_port))
+                    if rc == 0:
+                        io_ok = True
+                    else:
+                        io_err = f"응답 없음 (code {rc})"
+            except socket.gaierror:
+                # ★ [PATCH] [Errno 11001] getaddrinfo failed = 주소 문자열 자체가 잘못됨
+                io_err = "주소 형식 오류 - 설정 화면에서 IO 모듈 IP를 확인하세요"
+            except OSError as e:
+                io_err = str(e)
 
             # 4. 최종 결과 판별 (하나라도 실패하면 에러 반환)
             if sock1 is None:
@@ -957,7 +970,7 @@ class ConnectionThread(QThread):
                 self.finished_signal.emit(False, "Modbus(502) 연결 실패 (로봇 서버 확인)")
                 return
             if not io_ok:
-                self.finished_signal.emit(False, "IO 모듈 통신 실패 (전원 및 랜선을 확인하세요)")
+                self.finished_signal.emit(False, f"IO 모듈 통신 실패 ({self.io_ip}:{self.io_port}, {io_err}) - 전원/랜선/IP 확인")
                 return
             
             self.finished_signal.emit(True, "모든 시스템(로봇 및 IO) 연결 성공")
@@ -1228,6 +1241,9 @@ class BOLT(QMainWindow):
         self.state_timer = QtCore.QTimer(self)
         self.state_timer.timeout.connect(self.poll_robot_state)
         self.state_timer.start(100)
+
+        # ★ [PATCH] 상단 상태 표시줄에 IO 모듈 연결 상태 추가
+        self._init_io_conn_indicator()
         
         self.ui.logo.installEventFilter(self)
         self.logo_click_count = 0
@@ -1372,6 +1388,13 @@ class BOLT(QMainWindow):
     def start_background_connection(self):
         """프로그램 시작 후 자동으로 연결 시도 (스레드 사용)"""
         print("[System] 백그라운드 자동 연결 시작...")
+        for w in getattr(self, '_network_warnings', []):
+            try:
+                self.ui.scrollArea.append(f"[ERROR] {w}")
+            except Exception:
+                pass
+            self.report_alarm_signal.emit(w, "WARN")
+        self._network_warnings = []
         self.connect_robot(show_popup=False) # 팝업 없이 조용히 연결 시도
         
     def connect_systems(self):
@@ -1861,6 +1884,8 @@ class BOLT(QMainWindow):
         if hasattr(self, '_prev_io'):
             delattr(self, '_prev_io')
             
+        print(f"[Network] 접속 대상 - 로봇 {self.robot_ip}:{self.robot_port1}/{self.robot_port2}, "
+              f"Modbus {self.modbus_ip}:{self.modbus_port}, IO {self.io_ip}:{self.io_port}")
         self.io_module = IO_Module_Class(self.io_ip, self.io_port)
         self.io_module.start()
 
@@ -2085,6 +2110,63 @@ class BOLT(QMainWindow):
         else:
             self.start_job(cell_num=trigger_cell)
         
+    # ====================================================================
+    # ★ [PATCH] IO 모듈 연결 상태 표시 (상단: 로봇 상태 / 로봇 홈 상태 옆)
+    #   UI 파일(bolt.ui)을 다시 변환해도 사라지지 않도록 코드에서 위젯을 추가합니다.
+    # ====================================================================
+    def _init_io_conn_indicator(self):
+        try:
+            lay = self.ui.horizontalLayout_3
+            if lay.indexOf(self.ui.status_circle) < 0:
+                print("[UI WARN] 상단 상태 표시줄을 찾지 못해 IO 연결 표시를 추가하지 못했습니다.")
+                return
+
+            self.io_conn_circle = QLabel(self.ui.centralwidget)
+            self.io_conn_circle.setFixedSize(61, 61)
+            self.io_conn_circle.setText("")
+
+            self.io_conn_label = QLabel(self.ui.centralwidget)
+            self.io_conn_label.setStyleSheet(
+                "color: rgb(255, 255, 255); font: bold 20pt \"Arial\"; border: none; background: transparent;")
+
+            # 세로 구분선 (IO 모듈 상태 | 로봇 상태)
+            self.io_conn_sep = QFrame(self.ui.centralwidget)
+            self.io_conn_sep.setFixedSize(3, 55)
+            self.io_conn_sep.setStyleSheet("background-color: rgb(200, 200, 200); border: none;")
+
+            # 배치: [IO 모듈 상태]  |  [로봇 상태] [로봇 홈 상태] ...
+            lay.insertWidget(0, self.io_conn_circle)
+            lay.insertWidget(1, self.io_conn_label)
+            lay.insertSpacing(2, 25)
+            lay.insertWidget(3, self.io_conn_sep, 0, Qt.AlignVCenter)
+            lay.insertSpacing(4, 25)
+
+            self._io_conn_shown = None
+            self._set_io_conn_indicator(False)
+
+            self.io_conn_timer = QtCore.QTimer(self)
+            self.io_conn_timer.timeout.connect(self.update_io_conn_indicator)
+            self.io_conn_timer.start(300)
+        except Exception as e:
+            print(f"[UI WARN] IO 연결 표시 생성 실패: {e}")
+
+    def _set_io_conn_indicator(self, connected):
+        if self._io_conn_shown == connected:
+            return
+        self._io_conn_shown = connected
+        color = "green" if connected else "red"   # 로봇 상태 표시(status_circle)와 같은 색
+        self.io_conn_circle.setStyleSheet(f"border-radius: 30px; background-color: {color};")
+        self.io_conn_label.setText("IO 모듈 연결됨" if connected else "IO 모듈 연결 끊김")
+
+    def update_io_conn_indicator(self):
+        io = getattr(self, 'io_module', None)
+        try:
+            connected = (io is not None and hasattr(io, 'is_connected')
+                         and io.isRunning() and io.is_connected())
+        except Exception:
+            connected = False
+        self._set_io_conn_indicator(connected)
+
     def poll_robot_state(self):
         # ============================================================
         # 1. 스레드 프리징 방지 (중복 실행 차단 락)
@@ -4439,6 +4521,7 @@ class BOLT(QMainWindow):
     SFD_START_PULSE     = 0.5   # 피더 START 출력 유지 시간 [s] (기존값)
     SFD_DETECT_TIMEOUT  = 2.0   # START OFF 후 통과 감지 대기 [s]
     SFD_SETTLE_TIME     = 0.05  # 감지 후 팁 안착 대기 [s] (기존값)
+    SFD_READY_TO_SHOT_DELAY = 0.1  # ★ Ready 감지 후 슈팅 신호까지 대기 [s] (피더 정렬 안정화)
     SFD_SKIP_FEED_ON_EXTRA_PULSE = True
     # True: 직전 공급 이후 예상 밖 통과 펄스(지연 도착/이중 공급)가 있었으면
     #       팁에 볼트가 있다고 보고 이번 슈팅을 생략 (볼트 누적 → 파이프 파손 방지)
@@ -4509,8 +4592,11 @@ class BOLT(QMainWindow):
         if self._read_inputs_checked()[mdi_sfd_bolt_detect] == 1:
             print("[AUTO FEED WARN] 슈팅 전인데 통과 센서가 ON 상태입니다 (센서 앞 볼트 걸림/센서 이상 의심)")
 
+        # (1-1) ★ Ready 감지 후 잠시 대기한 뒤 슈팅
+        time.sleep(self.SFD_READY_TO_SHOT_DELAY)
+
         # (2) 슈팅 1회 + 통과 펄스 대기 (카운터 기준 → 짧은 펄스도 감시 스레드가 잡음)
-        print("[AUTO FEED] 피더기 Ready 확인 완료. 공급 펄스 전송 (1회)")
+        print(f"[AUTO FEED] 피더기 Ready 확인 완료 ({self.SFD_READY_TO_SHOT_DELAY:.1f}s 대기 후). 공급 펄스 전송 (1회)")
         base_cnt = self._sfd_get_pulse_count()
         self._bolt_detect_latched = False
         self.is_waiting_for_bolt = True
@@ -4869,9 +4955,14 @@ class BOLT(QMainWindow):
                     full_reason = f"{feed_note} / {reason}" if feed_note else reason
                     failed_bolts.append(f"{bolt_index} ({full_reason})")
                     print(f"[{step_name}] {bolt_index}번 NG 기록 - 작업 계속 진행 (종료 후 수동 체결)")
+                elif feed_note == "볼트 공급 미감지":
+                    # ★ [PATCH] 볼트 공급 미감지는 체결 결과가 OK여도 NG 목록에 올려
+                    #   작업 종료 후 NG 팝업 + 부저 3회로 작업자에게 알림 (확인 후 필요 시 수동 체결)
+                    failed_bolts.append(f"{bolt_index} (볼트 공급 미감지 - 체결 {res}, 확인 필요)")
+                    print(f"[{step_name}] {bolt_index}번: 볼트 공급 미감지 상태에서 체결 {res} "
+                          f"→ NG 목록에 확인 필요로 기록")
                 elif feed_note:
-                    print(f"[{step_name}] {bolt_index}번: {feed_note} 상태였으나 체결 {res} "
-                          f"(센서가 통과를 놓친 것으로 판단)")
+                    print(f"[{step_name}] {bolt_index}번: {feed_note} 상태였으나 체결 {res}")
             
             # ★ 기존에 있던 "elif not getattr(self, 'is_bolt_loaded', False):" 
             # (이동 중 볼트를 미리 쏘는 로직) 전체를 삭제했습니다!
@@ -6758,6 +6849,41 @@ class BOLT(QMainWindow):
     # =========================================================================
     # [Network & Serial] 설정 관리 (IP/Port/COM/Baudrate)
     # =========================================================================
+    # ====================================================================
+    # ★ [PATCH] IP 주소 정리/검증
+    #   [Errno 11001] getaddrinfo failed 는 주소 문자열이 IP로 해석되지 않을 때 발생합니다.
+    #   (예: 'COM3' 입력, 중간 공백, 전각 숫자/점, 쉼표, 끝의 점, 255 초과)
+    # ====================================================================
+    NET_IP_KEYS = ("ROBOT_29999", "ROBOT_30001", "ROBOT_MODBUS", "IO_MODULE")
+
+    @staticmethod
+    def _clean_ip_text(text):
+        """IPv4 문자열로 정리해서 반환. 정리해도 IP가 아니면 None."""
+        if text is None:
+            return None
+        s = unicodedata.normalize("NFKC", str(text))      # 전각 '１９２．１６８' → '192.168'
+        # 공백 + 눈에 안 보이는 문자(제로폭 공백 U+200B, 방향표시 U+200E, BOM U+FEFF, NULL 등) 제거
+        #   → 화면에는 '192.168.2.202'로 똑같이 보이지만 getaddrinfo가 실패하는 원인
+        s = "".join(c for c in s
+                    if not c.isspace() and not unicodedata.category(c).startswith(("C", "Z")))
+        s = s.replace(",", ".").replace("。", ".").strip(".")
+        parts = s.split(".")
+        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+            return None
+        nums = [int(p) for p in parts]                    # '010' → 10 (앞자리 0 제거)
+        if not all(0 <= n <= 255 for n in nums):
+            return None
+        ip = ".".join(str(n) for n in nums)
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            return None
+        return ip
+
+    def _net_key_of_row(self, row):
+        info = getattr(self, 'network_map', {}).get(row)
+        return info["key"] if info else None
+
     def init_network_ui(self, font_size=14):
         """
         DB에서 연결 정보(Ethernet + RS232)를 불러와 테이블을 초기화합니다.
@@ -6802,6 +6928,24 @@ class BOLT(QMainWindow):
                 val2 = info["default_port"]
                 self.db_manager.save_connection(key, val1, val2)
 
+            # ★ [PATCH] IP 행은 형식 정리/검증 (공백·전각문자·쉼표·앞자리 0 등 자동 보정)
+            ip_invalid_text = None
+            if key in self.NET_IP_KEYS:
+                cleaned = self._clean_ip_text(val1)
+                if cleaned is None:
+                    ip_invalid_text = str(val1)
+                    msg = (f"{info['name']} 주소 {str(val1).encode('unicode_escape').decode()!r}이(가) 올바른 IP가 아닙니다. "
+                           f"기본값({info['default_ip']})으로 접속합니다. 설정 화면에서 수정 후 저장하세요.")
+                    print(f"[Network ERROR] {msg}")
+                    if not hasattr(self, '_network_warnings'):
+                        self._network_warnings = []
+                    self._network_warnings.append(msg)
+                    val1 = info["default_ip"]
+                elif cleaned != val1:
+                    print(f"[Network] {info['name']} 주소 보정: {val1!r} → '{cleaned}' (DB 반영)")
+                    val1 = cleaned
+                    self.db_manager.save_connection(key, val1, val2)
+
             # 멤버 변수 업데이트
             if key == "ROBOT_29999":
                 self.robot_ip = val1
@@ -6824,9 +6968,13 @@ class BOLT(QMainWindow):
             table.setRowHeight(row_idx, row_height)
 
             # (C) 1열 (IP or COM)
-            item1 = QTableWidgetItem(str(val1))
+            item1 = QTableWidgetItem(str(ip_invalid_text if ip_invalid_text is not None else val1))
             item1.setFont(base_font)
             item1.setTextAlignment(Qt.AlignCenter)
+            if ip_invalid_text is not None:
+                # ★ [PATCH] 잘못된 주소는 빨간색으로 표시 (작업자가 바로 찾도록)
+                item1.setBackground(QColor("#FFCDD2"))
+                item1.setToolTip("올바르지 않은 IP 주소 - 수정 후 저장하세요")
             table.setItem(row_idx, 0, item1)
 
             # (D) 2열 (Port or Baudrate)
@@ -6859,7 +7007,10 @@ class BOLT(QMainWindow):
         self.show_touch_keyboard()
         
         # 2. 다이얼로그 제목 설정 (RS232 행 구분)
-        is_rs232 = (row == 3) # 3번 행이 너트러너 RS232
+        # ★ [PATCH] 기존 row == 3 은 'IO 모듈' 행이었음 (RS232는 4번 행)
+        #   → IO 모듈 주소를 누르면 "COM 포트 입력" 창이 떠서 COM 포트를 넣게 되는 문제
+        row_key = self._net_key_of_row(row)
+        is_rs232 = (row_key == "NR_RS232")
         
         if col == 0:
             title = "COM 포트 입력" if is_rs232 else "IP 주소 입력"
@@ -6877,8 +7028,33 @@ class BOLT(QMainWindow):
         # 4. 키보드 숨김
         self.hide_touch_keyboard()
         
-        # 5. 값 적용
+        # 5. 값 적용 (★ [PATCH] 입력 즉시 형식 검사)
         if ok and new_value:
+            new_value = new_value.strip()
+            if col == 0 and row_key in self.NET_IP_KEYS:
+                cleaned = self._clean_ip_text(new_value)
+                if cleaned is None:
+                    self.show_message("입력 오류",
+                        f"올바른 IP 주소가 아닙니다: '{new_value}'\n예) 192.168.0.10",
+                        QMessageBox.Warning)
+                    self.ui.ip_table.clearFocus()
+                    self.setFocus()
+                    return
+                new_value = cleaned
+                item.setBackground(QBrush())
+                item.setToolTip("")
+            elif col == 1:
+                try:
+                    v = int(new_value)
+                    if not is_rs232 and not (1 <= v <= 65535):
+                        raise ValueError
+                except ValueError:
+                    self.show_message("입력 오류",
+                        f"{'Baudrate' if is_rs232 else 'Port 번호(1~65535)'}는 숫자여야 합니다: '{new_value}'",
+                        QMessageBox.Warning)
+                    self.ui.ip_table.clearFocus()
+                    self.setFocus()
+                    return
             item.setText(new_value)
 
         self.ui.ip_table.clearFocus()
@@ -6892,6 +7068,32 @@ class BOLT(QMainWindow):
         """
         print("[Network] 설정 저장 및 재연결 시도...")
         
+        # ★ [PATCH] 저장 전 전체 검증 (하나라도 틀리면 아무것도 저장하지 않음)
+        for row, info in self.network_map.items():
+            it1 = self.ui.ip_table.item(row, 0)
+            it2 = self.ui.ip_table.item(row, 1)
+            if not it1 or not it2:
+                continue
+            if info["key"] in self.NET_IP_KEYS:
+                cleaned = self._clean_ip_text(it1.text())
+                if cleaned is None:
+                    self.show_message("입력 오류",
+                        f"{info['name']} 주소가 올바른 IP가 아닙니다: '{it1.text()}'\n예) 192.168.0.10",
+                        QMessageBox.Warning)
+                    return
+                it1.setText(cleaned)
+                it1.setBackground(QBrush())
+                it1.setToolTip("")
+                try:
+                    p = int(it2.text().strip())
+                    if not (1 <= p <= 65535):
+                        raise ValueError
+                except ValueError:
+                    self.show_message("입력 오류",
+                        f"{info['name']} Port 번호가 올바르지 않습니다: '{it2.text()}' (1~65535)",
+                        QMessageBox.Warning)
+                    return
+
         try:
             # 1. 테이블 값 읽어서 DB 저장
             for row, info in self.network_map.items():
